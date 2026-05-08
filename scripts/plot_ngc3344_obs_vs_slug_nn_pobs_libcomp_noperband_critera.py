@@ -59,12 +59,12 @@ CAT_PATH = (
 )
 NN_DIR = str(ROOT / "nn_models")
 OUTDIR = ROOT / "output_io"
-OUT_PNG = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs_no_pobs_clean_threshold.png"
-OUT_PDF = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs_no_pobs_clean_threshold.pdf"
-OUT_NPZ = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs_no_pobs_clean_threshold_hist.npz"
-OUT_4PANEL_PNG = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario_no_pobs_clean_threshold.png"
-OUT_4PANEL_PDF = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario_no_pobs_clean_threshold.pdf"
-OUT_4PANEL_NPZ = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario_no_pobs_clean_threshold_hist.npz"
+OUT_PNG = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs_libcomp_noperband_critera.png"
+OUT_PDF = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs_libcomp_noperband_critera.pdf"
+OUT_NPZ = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs_libcomp_noperband_critera_hist.npz"
+OUT_4PANEL_PNG = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario_libcomp_noperband_critera.png"
+OUT_4PANEL_PDF = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario_libcomp_noperband_critera.pdf"
+OUT_4PANEL_NPZ = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario_libcomp_noperband_critera_hist.npz"
 PHOT_FITS = Path("/g/data/jh2/jt4478/cluster_slug/tang_cluster_phot.fits")
 PROP_FITS = Path("/g/data/jh2/jt4478/cluster_slug/tang_cluster_prop.fits")
 CLEAN_COMP_THRESHOLD = 0.0
@@ -73,9 +73,9 @@ PARAMS_ALPHA_M2 = PARAMS.copy()
 PARAMS_ALPHA_M2[0] = -2.0
 
 SCENARIOS = [
-    ("best params + NN pobs", PARAMS.copy(), "nn"),
+    ("best params + inside-box libcomp", PARAMS.copy(), "nn"),
     ("best params + flat pobs", PARAMS.copy(), "flat"),
-    (r"$\alpha_M=-2$ + NN pobs", PARAMS_ALPHA_M2.copy(), "nn"),
+    (r"$\alpha_M=-2$ + inside-box libcomp", PARAMS_ALPHA_M2.copy(), "nn"),
     (r"$\alpha_M=-2$ + flat pobs", PARAMS_ALPHA_M2.copy(), "flat"),
 ]
 
@@ -334,7 +334,10 @@ def main() -> None:
             chunk_comps = []
             for k, (subset_filters, calc) in enumerate(calculators):
                 out = calc.compute(phot_neb_ex, dmod=float(cat["dmod"]), galaxy_fullname=GALAXY)
-                comp = out["comp_hybrid"]
+                # Test variant: drop NN pobs and hybrid per-band hard criteria
+                # (V cut, B/I, minimum bands). Keep only the catalog magnitude-box
+                # support so the library is still compared over the same photometric domain.
+                comp = np.asarray(out["inside_5d"], dtype=float)
                 chunk_comps.append(comp)
                 positive = comp > 0.0
                 pobs_kept[k] += int(np.sum(comp >= 0.01))
@@ -438,7 +441,7 @@ def main() -> None:
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
     axs[0].legend(loc="upper left", fontsize=7, frameon=True)
     fig.suptitle(
-        "NGC3344 observed vs SLUG predicted magnitudes\nMID best params, NN hybrid pobs",
+        "NGC3344 observed vs SLUG predicted magnitudes\nMID best params, libcomp_noperband_critera",
         fontsize=10,
         y=0.995,
     )
@@ -499,7 +502,7 @@ def main() -> None:
                 ax.set_xlabel("Absolute magnitude [mag]", fontsize=9)
     axs[0, 0].legend(loc="upper left", fontsize=7, frameon=True)
     fig.suptitle(
-        "NGC3344 observed vs SLUG predicted magnitudes\nno catalog pobs clean threshold",
+        "NGC3344 observed vs SLUG predicted magnitudes\nlibcomp_noperband_critera",
         fontsize=12,
         y=0.997,
     )

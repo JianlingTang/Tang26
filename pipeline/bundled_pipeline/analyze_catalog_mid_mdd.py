@@ -30,6 +30,8 @@ from completeness_io import (
 from hybrid_libcomp import (
     HybridLegusLibCompletenessCalculator,
     format_hybrid_libcomp_summary,
+    inside_5d_abs_box,
+    lib_column_indices,
     legus_catalog_abs_bounds,
 )
 
@@ -116,27 +118,39 @@ parser.add_argument(
     "--lib-vmag-max",
     type=float,
     default=-6.0,
-    help="force library completeness to 0 for rows with absolute V-band "
-    "magnitude > this cutoff (set to a very large value to effectively disable)",
+    help="legacy hybrid mode only: force library completeness to 0 for rows with absolute "
+    "V-band magnitude > this cutoff",
 )
 parser.add_argument(
     "--hybrid-libcomp",
-    default=True,
-    action="store_true",
-    help="use HybridLegusLibCompletenessCalculator (5D ABS box from catalog + per-band "
-    "rules + NN) instead of raw predict_catalog_completeness_with_nn for library rows",
+    dest="pobs_mode",
+    action="store_const",
+    const="hybrid",
+    help="legacy mode: use HybridLegusLibCompletenessCalculator (5D ABS box from catalog + "
+    "per-band rules + NN) for library pobs",
 )
 parser.add_argument(
     "--no-hybrid-libcomp",
-    dest="hybrid_libcomp",
-    action="store_false",
-    help="disable hybrid libcomp path and use direct NN prediction for library rows",
+    dest="pobs_mode",
+    action="store_const",
+    const="nn",
+    help="disable observed-box/hybrid masking and use direct NN prediction for library pobs",
+)
+parser.add_argument(
+    "--pobs-mode",
+    choices=("observed-box", "nn", "hybrid"),
+    default="observed-box",
+    help=(
+        "library pobs mode. observed-box (default): compute NN libcomp with no criteria, "
+        "then keep only rows inside the observed absolute-magnitude box. nn: direct NN "
+        "libcomp with no observed-box mask. hybrid: legacy 5D box + per-band/V/B-I/min-band rules."
+    ),
 )
 parser.add_argument(
     "--hybrid-range-margin",
     type=float,
     default=0.0,
-    help="expand catalog ABS [lo,hi] per band by this many mag for the 5D box (hybrid only)",
+    help="expand catalog ABS [lo,hi] per band by this many mag for observed-box/hybrid pobs modes",
 )
 parser.add_argument(
     "--hybrid-min-bands-nonzero",
@@ -429,7 +443,46 @@ def lnprob(params):
     # Return log likelihood
     return logL
 
-        
+
+def predict_library_completeness_no_criteria(
+    phot_neb_ex,
+    lib_indices,
+    dmod,
+    galaxy_fullname,
+    nn_dir,
+    subset_filters,
+    full_filter_order,
+    nn_scaler_path,
+    nn_model_path,
+    missing_band_fills=None,
+    batch_rows=65536,
+):
+    """
+    NN library completeness without astrophysical cuts.
+
+    Rows with non-finite NN input magnitudes cannot be passed through the
+    scaler/model, so they receive 0. No V cutoff, per-band flags, B/I rule,
+    minimum-band rule, or observed-box mask is applied here.
+    """
+    lib_phot_subset = np.asarray(phot_neb_ex[:, lib_indices], dtype=float) + float(dmod)
+    finite_rows = np.all(np.isfinite(lib_phot_subset), axis=1)
+    comp = np.zeros(len(finite_rows), dtype=float)
+    idx = np.flatnonzero(finite_rows)
+    bs = max(1024, int(batch_rows))
+    for start in range(0, idx.size, bs):
+        rows = idx[start:start + bs]
+        comp[rows] = predict_catalog_completeness_with_nn(
+            lib_phot_subset[rows],
+            galaxy_fullname=galaxy_fullname,
+            nn_dir=nn_dir,
+            subset_filters=subset_filters,
+            full_filter_order=full_filter_order,
+            nn_scaler_path=nn_scaler_path,
+            nn_model_path=nn_model_path,
+            missing_band_fills=missing_band_fills,
+        )
+    return comp, finite_rows
+
 
 
 
@@ -514,7 +567,7 @@ if args.cattype == "LEGUS":
         nn_scaler_path=args.nn_scaler,
         nn_model_path=args.nn_model,
         comp_threshold=args.comp_threshold,
-        enforce_hybrid_criteria=bool(args.hybrid_libcomp),
+        enforce_hybrid_criteria=(args.pobs_mode == "hybrid"),
         lib_vmag_max=float(args.lib_vmag_max),
         min_bands_nonzero=int(args.hybrid_min_bands_nonzero),
     )
@@ -579,31 +632,12 @@ del lib_all
 # catalogs and filter sets
 ncl_init = len(actual_mass)
 keep = np.zeros(ncl_init, dtype=np.bool)
-
-v_filter_candidates = ("ACS_F555W", "WFC3_UVIS_F555W")
-v_lib_idx = None
 lib_filter_names = [str(f) for f in filter_names]
-for fname in v_filter_candidates:
-    if fname in lib_filter_names:
-        v_lib_idx = lib_filter_names.index(fname)
-        break
-if v_lib_idx is None:
-    for i, fname in enumerate(lib_filter_names):
-        if str(fname).endswith("F555W"):
-            v_lib_idx = i
-            break
-faint_v_mask = None
-if v_lib_idx is not None:
-    v_abs = phot_neb_ex[:, v_lib_idx]
-    faint_v_mask = np.isfinite(v_abs) & (v_abs > args.lib_vmag_max)
-    if args.verbose:
-        print(
-            f"[nn-libcomp] V-band cutoff active: filter={lib_filter_names[v_lib_idx]}, "
-            f"cut={args.lib_vmag_max:.3f}, affected_rows={int(np.sum(faint_v_mask))}"
-        )
 
 for cat in catalogs:
     cat['libcomp'] = []
+    cat['libcomp_no_criteria'] = []
+    cat['pobs_observed_box'] = []
     for d in cat['filtersets_detect']:
         galaxy_fullname = cat.get("galaxy_fullname", cat["basename"])
         requested_filters = [str(f) for f in np.array(cat["filters"])[d]]
@@ -647,7 +681,7 @@ for cat in catalogs:
             use_apparent_magnitude=True,
         )
         nn_fill_kw = {"missing_band_fills": nn_uv_u_fills} if nn_uv_u_fills else {}
-        if args.hybrid_libcomp:
+        if args.pobs_mode == "hybrid":
             nn_scaler_path, nn_model_path = _nn_scaler_model_paths(
                 args.nn_comp_dir,
                 str(galaxy_fullname),
@@ -691,40 +725,62 @@ for cat in catalogs:
                 )
                 print(format_hybrid_libcomp_summary(summ))
         else:
-            lib_phot_subset = phot_neb_ex[:, lib_indices] + dmod
-            finite_rows = np.all(np.isfinite(lib_phot_subset), axis=1)
-            if np.all(finite_rows):
-                comp = predict_catalog_completeness_with_nn(
-                    lib_phot_subset,
-                    galaxy_fullname=galaxy_fullname,
-                    nn_dir=args.nn_comp_dir,
-                    subset_filters=subset_filters,
-                    full_filter_order=nn_full_order,
-                    nn_scaler_path=args.nn_scaler,
-                    nn_model_path=args.nn_model,
-                    **nn_fill_kw,
+            comp_no_criteria, finite_rows = predict_library_completeness_no_criteria(
+                phot_neb_ex,
+                lib_indices,
+                dmod,
+                galaxy_fullname,
+                args.nn_comp_dir,
+                subset_filters,
+                nn_full_order,
+                args.nn_scaler,
+                args.nn_model,
+                batch_rows=int(args.hybrid_nn_batch_rows),
+                **nn_fill_kw,
+            )
+            if args.verbose and not np.all(finite_rows):
+                n_bad = int(np.sum(~finite_rows))
+                print(
+                    f"[nn-libcomp-no-criteria] {cat['basename']} ({len(subset_filters)} bands): "
+                    f"skipping {n_bad} / {len(finite_rows)} library rows with non-finite photometry"
                 )
-            else:
+
+            if args.pobs_mode == "observed-box":
+                phot_sub = phot_cat_full[:, d]
+                detect_sub = detect_cat_full[:, d]
+                bounds_lo, bounds_hi = legus_catalog_abs_bounds(
+                    phot_sub,
+                    detect_sub,
+                    subset_filters,
+                    range_margin=float(args.hybrid_range_margin),
+                )
+                lib_cols = lib_column_indices(lib_filter_names, subset_filters)
+                inside_box = inside_5d_abs_box(
+                    phot_neb_ex,
+                    lib_cols,
+                    bounds_lo,
+                    bounds_hi,
+                )
+                comp = comp_no_criteria * inside_box.astype(float)
                 if args.verbose:
-                    n_bad = int(np.sum(~finite_rows))
                     print(
-                        f"[nn-libcomp] {cat['basename']} ({len(subset_filters)} bands): "
-                        f"skipping {n_bad} / {len(finite_rows)} library rows with non-finite photometry"
+                        f"[pobs-observed-box] {cat['basename']} ({len(subset_filters)} bands) "
+                        f"filterset={subset_filters!r}; "
+                        f"inside_box={int(np.sum(inside_box))}/{len(inside_box)}; "
+                        "criteria=observed_mag_box_only"
                     )
-                comp = np.zeros(len(finite_rows), dtype=float)
-                if np.any(finite_rows):
-                    comp[finite_rows] = predict_catalog_completeness_with_nn(
-                        lib_phot_subset[finite_rows],
-                        galaxy_fullname=galaxy_fullname,
-                        nn_dir=args.nn_comp_dir,
-                        subset_filters=subset_filters,
-                        full_filter_order=nn_full_order,
-                        nn_scaler_path=args.nn_scaler,
-                        nn_model_path=args.nn_model,
-                        **nn_fill_kw,
+            elif args.pobs_mode == "nn":
+                inside_box = np.ones(len(comp_no_criteria), dtype=bool)
+                comp = comp_no_criteria
+                if args.verbose:
+                    print(
+                        f"[nn-libcomp-no-criteria] {cat['basename']} ({len(subset_filters)} bands) "
+                        f"filterset={subset_filters!r}; no observed-box mask"
                     )
-            if faint_v_mask is not None and np.any(faint_v_mask):
-                comp[faint_v_mask] = 0.0
+            else:
+                raise ValueError(f"Unknown pobs_mode: {args.pobs_mode}")
+            cat['libcomp_no_criteria'].append(comp_no_criteria)
+            cat['pobs_observed_box'].append(inside_box.astype(float))
         cat['libcomp'].append(comp)
         # Keep only clusters that are at least mildly observable in any
         # catalog/filterset; near-zero probabilities are pruned.
@@ -742,6 +798,10 @@ phot_neb_ex = phot_neb_ex[keep]
 for cat in catalogs:
     for i in range(len(cat['libcomp'])):
         cat['libcomp'][i] = cat['libcomp'][i][keep]
+    for key in ('libcomp_no_criteria', 'pobs_observed_box'):
+        if key in cat:
+            for i in range(len(cat[key])):
+                cat[key][i] = cat[key][i][keep]
 if args.verbose:
     print("Pruned library from {:d} to {:d} clusters".
           format(ncl_init, len(actual_mass)))
@@ -841,4 +901,3 @@ if args.verbose:
     print("Starting MCMC")
 sampler = emcee.EnsembleSampler(args.nwalkers, ndim, lnprob, backend=backend)
 sampler.run_mcmc(p0, args.niter-nread)
-

@@ -84,7 +84,6 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
     --niter 4000 \
     --bwphot 0.05 \
     --bwphys 0.05 \
-    --hybrid-range-margin 0.5 \
     "${MODE_FLAG[@]}" \
     --outname "${OUTNAME}" \
     --verbose
