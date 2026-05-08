@@ -62,8 +62,21 @@ OUTDIR = ROOT / "output_io"
 OUT_PNG = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs.png"
 OUT_PDF = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs.pdf"
 OUT_NPZ = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs_hist.npz"
+OUT_4PANEL_PNG = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario.png"
+OUT_4PANEL_PDF = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario.pdf"
+OUT_4PANEL_NPZ = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_4scenario_hist.npz"
 PHOT_FITS = Path("/g/data/jh2/jt4478/cluster_slug/tang_cluster_phot.fits")
 PROP_FITS = Path("/g/data/jh2/jt4478/cluster_slug/tang_cluster_prop.fits")
+
+PARAMS_ALPHA_M2 = PARAMS.copy()
+PARAMS_ALPHA_M2[0] = -2.0
+
+SCENARIOS = [
+    ("best params + NN pobs", PARAMS.copy(), "nn"),
+    ("best params + flat pobs", PARAMS.copy(), "flat"),
+    (r"$\alpha_M=-2$ + NN pobs", PARAMS_ALPHA_M2.copy(), "nn"),
+    (r"$\alpha_M=-2$ + flat pobs", PARAMS_ALPHA_M2.copy(), "flat"),
+]
 
 
 class LibWgts:
@@ -199,13 +212,13 @@ def main() -> None:
     cat = catalogs[0]
     print(f"[catalog] after clean n={len(cat['phot'])}", flush=True)
 
-    print("[weights] sample density + MID best params", flush=True)
+    print("[weights] sample density + MID scenario params", flush=True)
     lib_den = SampleDen(
         slug_pdf(f"{CLUSTER_SLUG_LIB_DIR}/lib_mass.pdf"),
         slug_pdf(f"{CLUSTER_SLUG_LIB_DIR}/lib_time.pdf"),
         slug_pdf(f"{CLUSTER_SLUG_LIB_DIR}/lib_av.pdf"),
     )
-    libwgts = LibWgts(PARAMS)
+    scenario_wgts = [LibWgts(params) for _label, params, _pobs_mode in SCENARIOS]
 
     allfilters = sorted(list(cat["filters"]), key=filt_wave_key)
     filter_names = allfilters
@@ -259,7 +272,7 @@ def main() -> None:
     ncr = n_per_fs / np.sum(n_per_fs)
     nbin = 45
     hist_obs: dict[str, np.ndarray] = {}
-    model_counts: dict[str, np.ndarray] = {}
+    model_counts: dict[tuple[int, str], np.ndarray] = {}
     bin_centers: dict[str, np.ndarray] = {}
     bin_edges: dict[str, np.ndarray] = {}
 
@@ -275,7 +288,8 @@ def main() -> None:
         centers = 0.5 * (edges[:-1] + edges[1:])
         h_obs, _ = np.histogram(obs, bins=edges, density=True)
         hist_obs[filt] = h_obs
-        model_counts[filt] = np.zeros(nbin, dtype=float)
+        for si, _scenario in enumerate(SCENARIOS):
+            model_counts[(si, filt)] = np.zeros(nbin, dtype=float)
         bin_centers[filt] = centers
         bin_edges[filt] = edges
 
@@ -303,36 +317,49 @@ def main() -> None:
                 [np.asarray(phot_tab[f"{f}_neb_ex"][sl], dtype=float) for f in allfilters]
             )
             phys = np.column_stack([np.log10(target_mass), np.log10(eval_time), a_v])
-            base_w = libwgts.wgts(phys) / lib_den.sample_den(phys)
-            base_w = np.where(np.isfinite(base_w) & (base_w > 0.0), base_w, 0.0)
+            sample_density = lib_den.sample_den(phys)
+            base_weights = []
+            for libwgts in scenario_wgts:
+                base_w = libwgts.wgts(phys) / sample_density
+                base_weights.append(
+                    np.where(np.isfinite(base_w) & (base_w > 0.0), base_w, 0.0)
+                )
+            chunk_comps = []
             for k, (subset_filters, calc) in enumerate(calculators):
                 out = calc.compute(phot_neb_ex, dmod=float(cat["dmod"]), galaxy_fullname=GALAXY)
                 comp = out["comp_hybrid"]
+                chunk_comps.append(comp)
                 positive = comp > 0.0
                 pobs_kept[k] += int(np.sum(comp >= 0.01))
                 pobs_positive_sum[k] += float(np.sum(comp[positive]))
                 pobs_positive_n[k] += int(np.sum(positive))
-                weights = base_w * comp * ncr[k]
-                ok_w = np.isfinite(weights) & (weights > 0.0)
-                if not np.any(ok_w):
-                    continue
-                for filt in subset_filters:
-                    lib_idx = allfilters.index(filt)
-                    x = phot_neb_ex[:, lib_idx]
-                    ok = ok_w & np.isfinite(x)
-                    if np.any(ok):
-                        counts, _ = np.histogram(
-                            x[ok], bins=bin_edges[filt], weights=weights[ok]
-                        )
-                        model_counts[filt] += counts
+            for si, (_label, _params, pobs_mode) in enumerate(SCENARIOS):
+                for k, (subset_filters, _calc) in enumerate(calculators):
+                    comp = chunk_comps[k] if pobs_mode == "nn" else 1.0
+                    weights = base_weights[si] * comp * ncr[k]
+                    ok_w = np.isfinite(weights) & (weights > 0.0)
+                    if not np.any(ok_w):
+                        continue
+                    for filt in subset_filters:
+                        lib_idx = allfilters.index(filt)
+                        x = phot_neb_ex[:, lib_idx]
+                        ok = ok_w & np.isfinite(x)
+                        if np.any(ok):
+                            counts, _ = np.histogram(
+                                x[ok], bins=bin_edges[filt], weights=weights[ok]
+                            )
+                            model_counts[(si, filt)] += counts
             n_seen += stop - start
             if n_seen == n_total or n_seen % 1_000_000 == 0:
                 print(f"[library] processed {n_seen}/{n_total}", flush=True)
 
-    hist_model: dict[str, np.ndarray] = {}
-    for filt in allfilters:
-        area = float(np.sum(model_counts[filt] * np.diff(bin_edges[filt])))
-        hist_model[filt] = model_counts[filt] / area if area > 0.0 else model_counts[filt]
+    hist_model: dict[tuple[int, str], np.ndarray] = {}
+    for si, _scenario in enumerate(SCENARIOS):
+        for filt in allfilters:
+            area = float(np.sum(model_counts[(si, filt)] * np.diff(bin_edges[filt])))
+            hist_model[(si, filt)] = (
+                model_counts[(si, filt)] / area if area > 0.0 else model_counts[(si, filt)]
+            )
 
     for k, (subset_filters, _calc) in enumerate(calculators):
         mean_positive = (
@@ -349,7 +376,22 @@ def main() -> None:
         filters=np.array(allfilters),
         params=PARAMS,
         **{f"obs_{short_filter(f)}": hist_obs[f] for f in allfilters},
-        **{f"model_{short_filter(f)}": hist_model[f] for f in allfilters},
+        **{f"model_{short_filter(f)}": hist_model[(0, f)] for f in allfilters},
+        **{f"centers_{short_filter(f)}": bin_centers[f] for f in allfilters},
+    )
+
+    np.savez(
+        OUT_4PANEL_NPZ,
+        filters=np.array(allfilters),
+        scenario_labels=np.array([label for label, _params, _pobs_mode in SCENARIOS]),
+        scenario_pobs=np.array([pobs_mode for _label, _params, pobs_mode in SCENARIOS]),
+        scenario_params=np.vstack([params for _label, params, _pobs_mode in SCENARIOS]),
+        **{f"obs_{short_filter(f)}": hist_obs[f] for f in allfilters},
+        **{
+            f"model_s{si}_{short_filter(f)}": hist_model[(si, f)]
+            for si in range(len(SCENARIOS))
+            for f in allfilters
+        },
         **{f"centers_{short_filter(f)}": bin_centers[f] for f in allfilters},
     )
 
@@ -358,7 +400,7 @@ def main() -> None:
     for ax, filt, label in zip(axs, allfilters, labels):
         x = bin_centers[filt]
         obs = hist_obs[filt]
-        model = hist_model[filt]
+        model = hist_model[(0, filt)]
         ax.plot(x, obs, color="#0018a9", lw=1.3, label="Observed")
         ax.fill_between(x, np.maximum(obs, 1e-8), color="#0018a9", alpha=0.16)
         ax.plot(x, model, color="#ed1c23", lw=1.4, label="SLUG predicted")
@@ -388,6 +430,49 @@ def main() -> None:
     print(f"[write] {OUT_PNG}", flush=True)
     print(f"[write] {OUT_PDF}", flush=True)
     print(f"[write] {OUT_NPZ}", flush=True)
+
+    fig, axs = plt.subplots(
+        len(SCENARIOS),
+        len(allfilters),
+        figsize=(15.0, 9.8),
+        dpi=180,
+        sharey=True,
+        squeeze=False,
+    )
+    for si, (scenario_label, _params, _pobs_mode) in enumerate(SCENARIOS):
+        for fi, (filt, label) in enumerate(zip(allfilters, labels)):
+            ax = axs[si, fi]
+            x = bin_centers[filt]
+            obs = hist_obs[filt]
+            model = hist_model[(si, filt)]
+            ax.plot(x, obs, color="#0018a9", lw=1.2, label="Observed")
+            ax.fill_between(x, np.maximum(obs, 1e-8), color="#0018a9", alpha=0.14)
+            ax.plot(x, model, color="#ed1c23", lw=1.3, label="SLUG predicted")
+            ax.fill_between(x, np.maximum(model, 1e-8), color="#ed1c23", alpha=0.14)
+            ax.set_yscale("log")
+            ymax = max(1.2, float(max(np.nanmax(obs), np.nanmax(model))) * 1.5)
+            ax.set_ylim(1e-3, ymax)
+            ax.invert_xaxis()
+            ax.grid(alpha=0.2)
+            ax.tick_params(axis="both", which="both", direction="in", labelsize=8)
+            ax.yaxis.set_major_locator(LogLocator(base=10, numticks=4))
+            ax.xaxis.set_major_locator(MaxNLocator(4))
+            ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+            if si == 0:
+                ax.set_title(label, fontsize=10)
+            if fi == 0:
+                ax.set_ylabel(f"{scenario_label}\nPDF", fontsize=9)
+            if si == len(SCENARIOS) - 1:
+                ax.set_xlabel("Absolute magnitude [mag]", fontsize=9)
+    axs[0, 0].legend(loc="upper left", fontsize=7, frameon=True)
+    fig.suptitle("NGC3344 observed vs SLUG predicted magnitudes", fontsize=12, y=0.995)
+    fig.tight_layout(rect=(0.03, 0.03, 1.0, 0.97), h_pad=0.9, w_pad=0.55)
+    fig.savefig(OUT_4PANEL_PNG, bbox_inches="tight")
+    fig.savefig(OUT_4PANEL_PDF, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[write] {OUT_4PANEL_PNG}", flush=True)
+    print(f"[write] {OUT_4PANEL_PDF}", flush=True)
+    print(f"[write] {OUT_4PANEL_NPZ}", flush=True)
 
 
 if __name__ == "__main__":
