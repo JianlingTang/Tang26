@@ -1,0 +1,14 @@
+###############################################################
+# This is an A_V distribution definition file for SLUG v2.
+# This file defines the a flat A_V distribution from 0 - 3
+###############################################################
+
+# Breakpoints: mass values where the functional form changes
+# The first and last breakpoint will define the minimum and
+# maximum mass
+breakpoints 1.0e-6 3
+
+# Definitions of segments between the breakpoints
+segment
+type powerlaw
+slope 0.0

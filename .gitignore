@@ -1,0 +1,68 @@
+.venv/
+venv/
+.deps/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+output_io/
+output_chains/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data and outputs (do not commit)
+*.npy
+*.npz
+*.fits
+*.parquet
+ngc*/
+SLUG_library/
+PSF_files/
+ngc628-c/
+ngc628-c/*.fits
+ngc628-c/**/synthetic_fits/
+ngc628-c/**/synthetic_frames/
+ngc628-c/**/baolab/
+ngc628-c/**/detection_labels/
+ngc628-c/**/matched_coords/
+ngc628-c/**/diagnostics/
+ngc628-c/**/catalogue/
+physprop/
+tmp_pipeline_test/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+tests/output/
+
+# All other outputs
+logs/
+output/
+*.log
+output.param
+default.nnw
+nn_sweep_out/
+Save_detections.ipynb
+Save_detections_training_set.ipynb
+ci.py
+pyraf/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Personal / deploy checklists (do not push)
+docs/FILES_FOR_GIT.md
+docs/DEPLOY_FOR_PAPER.md

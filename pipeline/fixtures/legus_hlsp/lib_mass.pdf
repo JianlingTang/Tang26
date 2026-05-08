@@ -1,0 +1,7 @@
+breakpoints 1.0e2 1.0e5 1.0e7
+segment
+type powerlaw
+slope -1.0
+segment
+type powerlaw
+slope -2.0

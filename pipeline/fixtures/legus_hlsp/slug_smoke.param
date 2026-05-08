@@ -1,0 +1,23 @@
+model_name        SMOKE_LIB
+out_dir           /Users/janett/Documents/Tang+26B/slugfiles/tests/data/legus_hlsp
+verbosity         0
+sim_type          cluster
+n_trials          40
+time_step         1.0e7
+end_time          1.0e7
+cluster_mass      cmf
+out_cluster       1
+out_cluster_phot  1
+out_cluster_spec  0
+out_cluster_yield 0
+imf               lib/imf/chabrier.imf
+cmf               lib/cmf/cluster_slug_sampling.cmf
+clf               lib/clf/nodisrupt.clf
+tracks            padova_tpagb_yes
+atmospheres       lib/atmospheres
+specsyn_mode      sb99
+A_V               lib/avdist/flat.av
+extinction_curve  lib/extinct/MW_EXT_SLUG.dat
+phot_bands        QH0, QHe0, QHe1, Lbol, GALEX_FUV, GALEX_NUV, WFC3_UVIS_F218W, WFC3_UVIS_F225W, WFC3_UVIS_F275W, WFC3_UVIS_F336W, WFC3_UVIS_F360W, WFC3_UVIS_F438W, WFC3_UVIS_F475W, WFC3_UVIS_F555W, WFC3_UVIS_F606W, WFC3_UVIS_F775W, WFC3_UVIS_F814W, ACS_F435W, ACS_F475W, ACS_F555W, ACS_F606W, ACS_F625W, ACS_F775W, ACS_F814W, WFC3_IR_F098M, WFC3_IR_F105W, WFC3_IR_F110W, WFC3_IR_F125W, WFC3_IR_F140W, WFC3_IR_F160W, WFC3_UVIS_F547M, WFC3_UVIS_F657N, WFC3_UVIS_F658N, WFC3_IR_F128N, ACS_F550M, ACS_F658N, ACS_F660N, ACS_HRC_F330W, ACS_SBC_F125LP, ACS_SBC_F140LP, ACS_SBC_F150LP, ACS_SBC_F165LP, IRAC_3.6, IRAC_4.5, IRAC_5.8, IRAC_8.0, Johnson_V, Johnson_U, Johnson_B, Cousins_R, Cousins_I, SDSS_u, SDSS_g, SDSS_r, SDSS_i, SDSS_z, 2MASS_J, 2MASS_H, 2MASS_Ks
+filters           lib/filters
+phot_mode         L_nu
