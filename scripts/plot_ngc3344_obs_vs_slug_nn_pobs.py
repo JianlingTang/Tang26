@@ -12,8 +12,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from astropy.io import fits
 from matplotlib.ticker import AutoMinorLocator, LogLocator, MaxNLocator
-from slugpy import read_cluster, slug_pdf
+from slugpy import slug_pdf
 
 
 ROOT = Path("/g/data/jh2/jt4478/Tang26B")
@@ -61,6 +62,8 @@ OUTDIR = ROOT / "output_io"
 OUT_PNG = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs.png"
 OUT_PDF = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs.pdf"
 OUT_NPZ = OUTDIR / "ngc3344_observed_vs_slug_predicted_magnitudes_nn_pobs_hist.npz"
+PHOT_FITS = Path("/g/data/jh2/jt4478/cluster_slug/tang_cluster_phot.fits")
+PROP_FITS = Path("/g/data/jh2/jt4478/cluster_slug/tang_cluster_prop.fits")
 
 
 class LibWgts:
@@ -196,31 +199,20 @@ def main() -> None:
     cat = catalogs[0]
     print(f"[catalog] after clean n={len(cat['phot'])}", flush=True)
 
-    allfilters = sorted(list(cat["filters"]), key=filt_wave_key)
-    print(f"[read] slug library {LIBDIR} filters={allfilters}", flush=True)
-    lib_all = read_cluster(LIBDIR, photsystem="Vega", read_filters=allfilters)
-    actual_mass = np.asarray(lib_all.actual_mass)
-    eval_time = np.asarray(lib_all.time)
-    a_v = np.asarray(lib_all.A_V)
-    phot_neb_ex = np.asarray(lib_all.phot_neb_ex)
-    filter_names = [str(f) for f in lib_all.filter_names]
-    del lib_all
-    print(f"[library] shape={phot_neb_ex.shape} filters={filter_names}", flush=True)
-
     print("[weights] sample density + MID best params", flush=True)
     lib_den = SampleDen(
         slug_pdf(f"{CLUSTER_SLUG_LIB_DIR}/lib_mass.pdf"),
         slug_pdf(f"{CLUSTER_SLUG_LIB_DIR}/lib_time.pdf"),
         slug_pdf(f"{CLUSTER_SLUG_LIB_DIR}/lib_av.pdf"),
     )
-    phys = np.column_stack([np.log10(actual_mass), np.log10(eval_time), a_v])
-    base_w = LibWgts(PARAMS).wgts(phys) / lib_den.sample_den(phys)
-    base_w = np.where(np.isfinite(base_w) & (base_w > 0.0), base_w, 0.0)
+    libwgts = LibWgts(PARAMS)
 
-    cat["libcomp"] = []
+    allfilters = sorted(list(cat["filters"]), key=filt_wave_key)
+    filter_names = allfilters
     scaler_path, model_path = _nn_scaler_model_paths(NN_DIR, GALAXY, None, None)
     print(f"[nn] scaler={scaler_path}", flush=True)
     print(f"[nn] model={model_path}", flush=True)
+    calculators = []
     for d in cat["filtersets_detect"]:
         requested_filters = [str(f) for f in np.array(cat["filters"])[d]]
         subset_filters = sorted(requested_filters, key=filt_wave_key)
@@ -261,23 +253,15 @@ def main() -> None:
             nn_batch_rows=65536,
             nn_missing_band_fills=nn_uv_u_fills,
         )
-        print(f"[pobs] computing {subset_filters}", flush=True)
-        out = calc.compute(phot_neb_ex, dmod=dmod, galaxy_fullname=GALAXY)
-        comp = out["comp_hybrid"]
-        cat["libcomp"].append(comp)
-        positive = comp > 0.0
-        print(
-            f"[pobs] {subset_filters} kept>0.01={int(np.sum(comp >= 0.01))} "
-            f"mean_positive={float(np.mean(comp[positive])) if np.any(positive) else 0.0:.4g}",
-            flush=True,
-        )
+        calculators.append((subset_filters, calc))
 
     n_per_fs = np.array([len(p) for p in cat["phot_filterset"]], dtype=float)
     ncr = n_per_fs / np.sum(n_per_fs)
     nbin = 45
     hist_obs: dict[str, np.ndarray] = {}
-    hist_model: dict[str, np.ndarray] = {}
+    model_counts: dict[str, np.ndarray] = {}
     bin_centers: dict[str, np.ndarray] = {}
+    bin_edges: dict[str, np.ndarray] = {}
 
     for filt in allfilters:
         cat_idx = list(cat["filters"]).index(filt)
@@ -285,28 +269,80 @@ def main() -> None:
             cat["phot"][:, cat_idx]
         )
         obs = np.asarray(cat["phot"][obs_mask, cat_idx], dtype=float)
-        lib_idx = filter_names.index(filt)
         lo = float(np.nanmin(obs)) - 0.75
         hi = float(np.nanmax(obs)) + 0.75
         edges = np.linspace(lo, hi, nbin + 1)
         centers = 0.5 * (edges[:-1] + edges[1:])
         h_obs, _ = np.histogram(obs, bins=edges, density=True)
-        h_model = np.zeros(nbin, dtype=float)
-        for k, fs in enumerate(cat["filtersets"]):
-            if filt not in fs:
-                continue
-            weights = base_w * cat["libcomp"][k]
-            x = phot_neb_ex[:, lib_idx]
-            ok = np.isfinite(x) & np.isfinite(weights) & (weights > 0.0)
-            if np.any(ok):
-                h, _ = np.histogram(x[ok], bins=edges, weights=weights[ok], density=True)
-                h_model += h * ncr[k]
-        area = float(np.sum(h_model * np.diff(edges)))
-        if area > 0.0:
-            h_model /= area
         hist_obs[filt] = h_obs
-        hist_model[filt] = h_model
+        model_counts[filt] = np.zeros(nbin, dtype=float)
         bin_centers[filt] = centers
+        bin_edges[filt] = edges
+
+    chunk_rows = 200_000
+    n_seen = 0
+    pobs_kept = [0 for _ in calculators]
+    pobs_positive_sum = [0.0 for _ in calculators]
+    pobs_positive_n = [0 for _ in calculators]
+    print(
+        f"[read] chunked SLUG library phot={PHOT_FITS.name} prop={PROP_FITS.name}",
+        flush=True,
+    )
+    with fits.open(PHOT_FITS, memmap=True) as phot_hdul, fits.open(PROP_FITS, memmap=True) as prop_hdul:
+        phot_tab = phot_hdul[1].data
+        prop_tab = prop_hdul[1].data
+        n_total = len(prop_tab)
+        print(f"[library] rows={n_total} filters={filter_names}", flush=True)
+        for start in range(0, n_total, chunk_rows):
+            stop = min(start + chunk_rows, n_total)
+            sl = slice(start, stop)
+            target_mass = np.asarray(prop_tab["TargetMass"][sl], dtype=float)
+            eval_time = np.asarray(prop_tab["Time"][sl], dtype=float)
+            a_v = np.asarray(prop_tab["A_V"][sl], dtype=float)
+            phot_neb_ex = np.column_stack(
+                [np.asarray(phot_tab[f"{f}_neb_ex"][sl], dtype=float) for f in allfilters]
+            )
+            phys = np.column_stack([np.log10(target_mass), np.log10(eval_time), a_v])
+            base_w = libwgts.wgts(phys) / lib_den.sample_den(phys)
+            base_w = np.where(np.isfinite(base_w) & (base_w > 0.0), base_w, 0.0)
+            for k, (subset_filters, calc) in enumerate(calculators):
+                out = calc.compute(phot_neb_ex, dmod=float(cat["dmod"]), galaxy_fullname=GALAXY)
+                comp = out["comp_hybrid"]
+                positive = comp > 0.0
+                pobs_kept[k] += int(np.sum(comp >= 0.01))
+                pobs_positive_sum[k] += float(np.sum(comp[positive]))
+                pobs_positive_n[k] += int(np.sum(positive))
+                weights = base_w * comp * ncr[k]
+                ok_w = np.isfinite(weights) & (weights > 0.0)
+                if not np.any(ok_w):
+                    continue
+                for filt in subset_filters:
+                    lib_idx = allfilters.index(filt)
+                    x = phot_neb_ex[:, lib_idx]
+                    ok = ok_w & np.isfinite(x)
+                    if np.any(ok):
+                        counts, _ = np.histogram(
+                            x[ok], bins=bin_edges[filt], weights=weights[ok]
+                        )
+                        model_counts[filt] += counts
+            n_seen += stop - start
+            if n_seen == n_total or n_seen % 1_000_000 == 0:
+                print(f"[library] processed {n_seen}/{n_total}", flush=True)
+
+    hist_model: dict[str, np.ndarray] = {}
+    for filt in allfilters:
+        area = float(np.sum(model_counts[filt] * np.diff(bin_edges[filt])))
+        hist_model[filt] = model_counts[filt] / area if area > 0.0 else model_counts[filt]
+
+    for k, (subset_filters, _calc) in enumerate(calculators):
+        mean_positive = (
+            pobs_positive_sum[k] / pobs_positive_n[k] if pobs_positive_n[k] > 0 else 0.0
+        )
+        print(
+            f"[pobs] {subset_filters} kept>0.01={pobs_kept[k]} "
+            f"mean_positive={mean_positive:.4g}",
+            flush=True,
+        )
 
     np.savez(
         OUT_NPZ,
