@@ -6,16 +6,17 @@
 #PBS -l mem=100GB
 #PBS -l jobfs=10GB
 #PBS -l wd
-#PBS -N nn_ngc3344_mid
+#PBS -N nn_ngc3344_mdd_pobs_nn
 #PBS -j oe
 #PBS -m bea
 #PBS -M janet.tang@anu.edu.au
-#PBS -o /scratch/jh2/jt4478/output/nn_ngc3344_mid.o
-#PBS -e /scratch/jh2/jt4478/output/nn_ngc3344_mid.e
+#PBS -o /scratch/jh2/jt4478/output/nn_ngc3344_mdd_pobs_nn.o
+#PBS -e /scratch/jh2/jt4478/output/nn_ngc3344_mdd_pobs_nn.e
 #PBS -l storage=scratch/jh2+gdata/jh2
 
 GALAXY="ngc3344"
-MODE="mid"
-OUTNAME="ngc3344_mid_no_hybrid_pobs.h5"
-export GALAXY MODE OUTNAME
+MODE="mdd"
+POBS_MODE="nn"
+OUTNAME="ngc3344_mdd_pobs_nn.h5"
+export GALAXY MODE POBS_MODE OUTNAME
 exec /g/data/jh2/jt4478/Tang26B/pipeline/scripts/nn_mid_mdd_jobs/run_one_nn_mid_mdd.sh

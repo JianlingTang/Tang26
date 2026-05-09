@@ -1,6 +1,6 @@
 #!/bin/bash
-#PBS -P jh2
-#PBS -q expresssr
+#PBS -P mk27
+#PBS -q rsaa
 #PBS -l walltime=24:00:00
 #PBS -l ncpus=104
 #PBS -l mem=100GB
