@@ -3,6 +3,8 @@ set -euo pipefail
 
 : "${MODE:?MODE is required: mid or mdd}"
 : "${OUTNAME:?OUTNAME is required}"
+POBS_MODE="${POBS_MODE:-observed-box}"
+LIB_VMAG_MAX="${LIB_VMAG_MAX:--6.0}"
 
 if [[ -n "${GALAXY_NAMES:-}" ]]; then
   read -r -a GALAXY_ARGS <<< "${GALAXY_NAMES}"
@@ -29,6 +31,11 @@ OUT_CHAIN_DIR="/g/data/jh2/jt4478/Tang26B/output_chains"
 
 if [[ "${MODE}" != "mid" && "${MODE}" != "mdd" ]]; then
   echo "ERROR: MODE must be mid or mdd, got ${MODE}" >&2
+  exit 1
+fi
+
+if [[ "${POBS_MODE}" != "observed-box" && "${POBS_MODE}" != "nn" && "${POBS_MODE}" != "hybrid" ]]; then
+  echo "ERROR: POBS_MODE must be observed-box, nn, or hybrid, got ${POBS_MODE}" >&2
   exit 1
 fi
 
@@ -65,6 +72,8 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
   echo "GALAXY_NAMES=${GALAXY_ARGS[*]}"
   echo "MODE=${MODE}"
   echo "OUTNAME=${OUTNAME}"
+  echo "POBS_MODE=${POBS_MODE}"
+  echo "LIB_VMAG_MAX=${LIB_VMAG_MAX}"
   python3 -c "import torch, sklearn; print('torch', torch.__version__, torch.__file__); print('sklearn', sklearn.__version__, sklearn.__file__)"
 
   python "${BUNDLE_DIR}/analyze_catalog_mid_mdd.py" \
@@ -84,7 +93,9 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
     --niter 4000 \
     --bwphot 0.05 \
     --bwphys 0.05 \
-    --hybrid-range-margin 0.5 \
+    --hybrid-range-margin 0.1 \
+    --pobs-mode "${POBS_MODE}" \
+    --lib-vmag-max "${LIB_VMAG_MAX}" \
     "${MODE_FLAG[@]}" \
     --outname "${OUTNAME}" \
     --verbose

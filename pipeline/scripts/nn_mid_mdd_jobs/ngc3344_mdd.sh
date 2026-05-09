@@ -1,6 +1,6 @@
 #!/bin/bash
-#PBS -P jh2
-#PBS -q expresssr
+#PBS -P mk27
+#PBS -q rsaa
 #PBS -l walltime=24:00:00
 #PBS -l ncpus=104
 #PBS -l mem=100GB
@@ -16,6 +16,6 @@
 
 GALAXY="ngc3344"
 MODE="mdd"
-OUTNAME="ngc3344_mdd.h5"
+OUTNAME="ngc3344_mdd_no_hybrid_pobs.h5"
 export GALAXY MODE OUTNAME
 exec /g/data/jh2/jt4478/Tang26B/pipeline/scripts/nn_mid_mdd_jobs/run_one_nn_mid_mdd.sh
