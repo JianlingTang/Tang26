@@ -180,7 +180,7 @@ def test_predict_catalog_nn_tiny_checkpoint(tmp_path):
 def test_analyze_catalog_mid_mdd_cli_requires_nn_combo():
     pytest.importorskip("slugpy.cluster_slug")
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    script = os.path.join(root, "python3_sc", "analyze_catalog_mid_mdd.py")
+    script = os.path.join(root, "bundled_pipeline", "analyze_catalog_mid_mdd.py")
     cat = os.path.join(
         root,
         "tests",

@@ -166,6 +166,31 @@ parser.add_argument(
     default=65536,
     help="batch size for joint NN inside hybrid calculator (hybrid only)",
 )
+parser.add_argument(
+    "--test-pobs-mode",
+    choices=("none", "bright-v-cut", "shift-completeness-minus1"),
+    default="none",
+    help=(
+        "test-only pobs/catalog ablation. none: original behavior. "
+        "bright-v-cut: fit only observed clusters with absolute M_V < --test-v-abs-cut "
+        "and force library comp=0 for M_V > --test-v-abs-cut. "
+        "shift-completeness-minus1: evaluate NN completeness after shifting magnitudes "
+        "by --test-completeness-mag-shift (default -1 mag, i.e. apparent 25 -> 24), "
+        "and apply the same shift to absolute magnitudes used by observed-box/hybrid gates."
+    ),
+)
+parser.add_argument(
+    "--test-v-abs-cut",
+    type=float,
+    default=-6.5,
+    help="absolute V cut for --test-pobs-mode bright-v-cut; keep observed M_V < cut, library M_V > cut has comp=0",
+)
+parser.add_argument(
+    "--test-completeness-mag-shift",
+    type=float,
+    default=-1.0,
+    help="magnitude shift for --test-pobs-mode shift-completeness-minus1; applied to NN apparent inputs and absolute mags used by gates",
+)
 parser.add_argument("-ct", "--cattype", default="LEGUS",
                     help="type of input catalog; currently "
                     "known values are 'mock' and 'LEGUS' and 'LEGUS_rOGC'; this "
@@ -486,6 +511,75 @@ def predict_library_completeness_no_criteria(
     return comp, finite_rows
 
 
+def _resolve_v_index(filters):
+    for cand in ("ACS_F555W", "WFC3_UVIS_F555W"):
+        if cand in list(filters):
+            return list(filters).index(cand)
+    for i, filt in enumerate(filters):
+        if str(filt).endswith("F555W"):
+            return i
+    raise ValueError(f"Could not resolve V/F555W filter in {filters!r}")
+
+
+def _rebuild_filtersets_for_catalog(data):
+    filtersets = []
+    filtersets_detect = []
+    fset = np.zeros(len(data["phot"]))
+    for i, d in enumerate(data["detect"]):
+        f = list(np.array(data["filters"])[d])
+        if f not in filtersets:
+            filtersets.append(f)
+            filtersets_detect.append(np.copy(d))
+        fset[i] = filtersets.index(f)
+    data["filtersets"] = filtersets
+    data["filtersets_index"] = fset
+    data["filtersets_detect"] = filtersets_detect
+    data["cid_filterset"] = []
+    data["phot_filterset"] = []
+    data["photerr_filterset"] = []
+    for i, d in enumerate(filtersets_detect):
+        idx = fset == i
+        data["cid_filterset"].append(data["cid"][idx])
+        data["phot_filterset"].append(data["phot"][idx][:, d])
+        data["photerr_filterset"].append(data["photerr"][idx][:, d])
+
+
+def _subset_catalog_rows(data, row_mask):
+    row_mask = np.asarray(row_mask, dtype=bool)
+    nrow = len(row_mask)
+    for key, val in list(data.items()):
+        if key in {
+            "filtersets",
+            "filtersets_index",
+            "filtersets_detect",
+            "cid_filterset",
+            "phot_filterset",
+            "photerr_filterset",
+            "comp_filterset",
+        }:
+            continue
+        if isinstance(val, np.ndarray) and val.shape[:1] == (nrow,):
+            data[key] = val[row_mask]
+        elif isinstance(val, list) and len(val) == nrow:
+            data[key] = [v for v, keep in zip(val, row_mask) if keep]
+    _rebuild_filtersets_for_catalog(data)
+
+
+def _apply_observed_absolute_v_cut(catalogs, v_abs_cut):
+    for cat in catalogs:
+        v_idx = _resolve_v_index(cat["filters"])
+        phot = np.asarray(cat["phot"], dtype=float)
+        detect = np.asarray(cat["detect"], dtype=bool)
+        keep = detect[:, v_idx] & np.isfinite(phot[:, v_idx]) & (phot[:, v_idx] < float(v_abs_cut))
+        before = len(keep)
+        _subset_catalog_rows(cat, keep)
+        print(
+            f"[test-pobs bright-v-cut] {cat['basename']}: observed absolute M_V < {v_abs_cut:g}; "
+            f"kept {int(np.sum(keep))}/{before}",
+            flush=True,
+        )
+
+
 
 
 ###############
@@ -581,6 +675,10 @@ if args.cattype == "LEGUS":
 elif args.cattype == "LEGUS_rOGC":
     ncl = clean_legus_comp(catalogs, args.verbose)
 
+if args.test_pobs_mode == "bright-v-cut":
+    _apply_observed_absolute_v_cut(catalogs, args.test_v_abs_cut)
+    ncl = sum(len(cat["phot"]) for cat in catalogs)
+
 # We're now done ingesting the input catalogs; print status if verbose
 if args.verbose:
     print("Completed reading the following input catalogs:")
@@ -635,6 +733,24 @@ del lib_all
 ncl_init = len(actual_mass)
 keep = np.zeros(ncl_init, dtype=np.bool)
 lib_filter_names = [str(f) for f in filter_names]
+test_mag_shift = (
+    float(args.test_completeness_mag_shift)
+    if args.test_pobs_mode == "shift-completeness-minus1"
+    else 0.0
+)
+if args.test_pobs_mode == "shift-completeness-minus1":
+    print(
+        f"[test-pobs shift-completeness-minus1] shifting NN apparent inputs and "
+        f"absolute library mags used by gates by {test_mag_shift:+g} mag",
+        flush=True,
+    )
+v_lib_idx_for_test_cut = None
+if args.test_pobs_mode == "bright-v-cut":
+    v_lib_idx_for_test_cut = _resolve_v_index(lib_filter_names)
+    print(
+        f"[test-pobs bright-v-cut] library comp forced to 0 for absolute M_V > {args.test_v_abs_cut:g}",
+        flush=True,
+    )
 
 for cat in catalogs:
     cat['libcomp'] = []
@@ -671,6 +787,16 @@ for cat in catalogs:
         dmod = float(cat.get("dmod")) #TODO: If dmod is not set, raise an error instead of silently using 0.0, which will lead to incorrect completeness calculations.
         if dmod is None:
             raise ValueError(f"Distance modulus not set for catalog {cat['basename']}")
+        phot_neb_ex_for_comp = (
+            phot_neb_ex + test_mag_shift
+            if args.test_pobs_mode == "shift-completeness-minus1"
+            else phot_neb_ex
+        )
+        dmod_for_nn = (
+            dmod + test_mag_shift
+            if args.test_pobs_mode == "shift-completeness-minus1"
+            else dmod
+        )
         phot_cat_full = np.asarray(cat["phot"], dtype=float)
         detect_cat_full = np.asarray(cat["detect"], dtype=bool)
         nn_uv_u_fills = legus_nn_missing_uv_u_fills(
@@ -682,6 +808,10 @@ for cat in catalogs:
             subset_filters,
             use_apparent_magnitude=True,
         )
+        if args.test_pobs_mode == "shift-completeness-minus1" and nn_uv_u_fills:
+            nn_uv_u_fills = {
+                str(k): float(v) + test_mag_shift for k, v in nn_uv_u_fills.items()
+            }
         nn_fill_kw = {"missing_band_fills": nn_uv_u_fills} if nn_uv_u_fills else {}
         if args.pobs_mode == "hybrid":
             nn_scaler_path, nn_model_path = _nn_scaler_model_paths(
@@ -714,7 +844,7 @@ for cat in catalogs:
                 nn_missing_band_fills=nn_uv_u_fills,
             )
             out = calc.compute(
-                phot_neb_ex,
+                phot_neb_ex_for_comp,
                 dmod=dmod,
                 galaxy_fullname=str(galaxy_fullname),
             )
@@ -730,7 +860,7 @@ for cat in catalogs:
             comp_no_criteria, finite_rows = predict_library_completeness_no_criteria(
                 phot_neb_ex,
                 lib_indices,
-                dmod,
+                dmod_for_nn,
                 galaxy_fullname,
                 args.nn_comp_dir,
                 subset_filters,
@@ -758,7 +888,7 @@ for cat in catalogs:
                 )
                 lib_cols = lib_column_indices(lib_filter_names, subset_filters)
                 inside_box = inside_5d_abs_box(
-                    phot_neb_ex,
+                    phot_neb_ex_for_comp,
                     lib_cols,
                     bounds_lo,
                     bounds_hi,
@@ -783,6 +913,19 @@ for cat in catalogs:
                 raise ValueError(f"Unknown pobs_mode: {args.pobs_mode}")
             cat['libcomp_no_criteria'].append(comp_no_criteria)
             cat['pobs_observed_box'].append(inside_box.astype(float))
+        if args.test_pobs_mode == "bright-v-cut":
+            v_abs = np.asarray(phot_neb_ex[:, int(v_lib_idx_for_test_cut)], dtype=float)
+            faint_v = np.isfinite(v_abs) & (v_abs > float(args.test_v_abs_cut))
+            n_before = int(np.sum(np.asarray(comp) >= args.comp_threshold))
+            comp = np.asarray(comp, dtype=float)
+            comp[faint_v] = 0.0
+            n_after = int(np.sum(comp >= args.comp_threshold))
+            if args.verbose:
+                print(
+                    f"[test-pobs bright-v-cut] {cat['basename']} filterset={subset_filters!r}; "
+                    f"lib rows kept by comp threshold before/after V cut: {n_before}/{n_after}",
+                    flush=True,
+                )
         cat['libcomp'].append(comp)
         # Keep only clusters that are at least mildly observable in any
         # catalog/filterset; near-zero probabilities are pruned.
