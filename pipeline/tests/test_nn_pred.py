@@ -24,12 +24,14 @@ import argparse
 import sys
 from pathlib import Path
 
-import matplotlib
 import numpy as np
-from slugpy import read_cluster
+import pytest
 
+matplotlib = pytest.importorskip("matplotlib")
+read_cluster = pytest.importorskip("slugpy").read_cluster
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+
+plt = pytest.importorskip("matplotlib.pyplot")
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "bundled_pipeline"))

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test-lint-format:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pipeline
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: pipeline/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Run ruff
+        run: >
+          uvx ruff check
+          --select E9,F63,F7,F82
+          --exclude '._*'
+          bundled_pipeline/analyze_catalog_mid_mdd.py
+          bundled_pipeline/analyze_catalog_mid_mdd_test_pobs.py
+          bundled_pipeline/hybrid_libcomp.py
+          tests/compare_logl_ablation.py
+          tests/test_nn_completeness.py
+          tests/test_libcomp.py
+          tests/test_library_pruning.py
+          tests/test_nn_inputs.py
+          tests/test_nn_pred.py
+
+      - name: Run black
+        run: >
+          uvx black --check
+          src/legus_slug_pipeline/__init__.py
+          src/legus_slug_pipeline/config.py
+          tests/test_smoke.py

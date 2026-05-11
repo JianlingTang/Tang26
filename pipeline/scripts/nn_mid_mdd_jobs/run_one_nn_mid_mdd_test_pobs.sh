@@ -5,6 +5,9 @@ set -euo pipefail
 : "${OUTNAME:?OUTNAME is required}"
 POBS_MODE="${POBS_MODE:-observed-box}"
 LIB_VMAG_MAX="${LIB_VMAG_MAX:--6.0}"
+TEST_POBS_MODE="${TEST_POBS_MODE:-none}"
+TEST_V_ABS_CUT="${TEST_V_ABS_CUT:--6.5}"
+TEST_COMPLETENESS_MAG_SHIFT="${TEST_COMPLETENESS_MAG_SHIFT:--1.0}"
 
 if [[ -n "${GALAXY_NAMES:-}" ]]; then
   GALAXY_NAMES_NORMALIZED="${GALAXY_NAMES//,/ }"
@@ -76,9 +79,12 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
   echo "OUTNAME=${OUTNAME}"
   echo "POBS_MODE=${POBS_MODE}"
   echo "LIB_VMAG_MAX=${LIB_VMAG_MAX}"
+  echo "TEST_POBS_MODE=${TEST_POBS_MODE}"
+  echo "TEST_V_ABS_CUT=${TEST_V_ABS_CUT}"
+  echo "TEST_COMPLETENESS_MAG_SHIFT=${TEST_COMPLETENESS_MAG_SHIFT}"
   python3 -c "import torch, sklearn; print('torch', torch.__version__, torch.__file__); print('sklearn', sklearn.__version__, sklearn.__file__)"
 
-  python "${BUNDLE_DIR}/analyze_catalog_mid_mdd.py" \
+  python "${BUNDLE_DIR}/analyze_catalog_mid_mdd_test_pobs.py" \
     "${CLUSTER_SLUG_LIB_NAME}" \
     "${CLUSTER_SLUG_LIB_DIR}/lib_mass.pdf" \
     "${CLUSTER_SLUG_LIB_DIR}/lib_time.pdf" \
@@ -98,6 +104,9 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
     --hybrid-range-margin 0.05 \
     --pobs-mode "${POBS_MODE}" \
     --lib-vmag-max "${LIB_VMAG_MAX}" \
+    --test-pobs-mode "${TEST_POBS_MODE}" \
+    --test-v-abs-cut "${TEST_V_ABS_CUT}" \
+    --test-completeness-mag-shift "${TEST_COMPLETENESS_MAG_SHIFT}" \
     "${MODE_FLAG[@]}" \
     --outname "${OUTNAME}" \
     --verbose

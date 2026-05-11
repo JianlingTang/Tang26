@@ -43,8 +43,15 @@ sys.path.insert(0, osp.join(ROOT, "bundled_pipeline"))
 from catalog_readers import reader_register  # noqa: E402
 from clean_legus import clean_legus  # noqa: E402
 from completeness_io import (  # noqa: E402
+    _nn_scaler_model_paths,
     legus_nn_missing_uv_u_fills,
     predict_catalog_completeness_with_nn,
+)
+from hybrid_libcomp import (  # noqa: E402
+    HybridLegusLibCompletenessCalculator,
+    inside_5d_abs_box,
+    lib_column_indices,
+    legus_catalog_abs_bounds,
 )
 
 
@@ -157,6 +164,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tabulated-comp-dir", default="/scratch/jh2/jt4478/tabulated_comp")
     p.add_argument("--clean-mode", choices=["nn", "none"], default="nn")
     p.add_argument("--libcomp-mode", choices=["nn", "tabulated"], default="nn")
+    p.add_argument("--pobs-mode", choices=["observed-box", "nn", "hybrid"], default="hybrid")
+    p.add_argument("--hybrid-range-margin", type=float, default=0.1)
+    p.add_argument("--hybrid-min-bands-nonzero", type=int, default=4)
+    p.add_argument("--hybrid-nn-batch-rows", type=int, default=65536)
+    p.add_argument("--params", nargs="+", type=float, default=None)
     p.add_argument("--comp-threshold", type=float, default=0.01)
     p.add_argument("--lib-vmag-max", type=float, default=-6.0)
     p.add_argument("--photsystem", default="Vega")
@@ -262,6 +274,9 @@ def main() -> int:
             nn_scaler_path=args.nn_scaler,
             nn_model_path=args.nn_model,
             comp_threshold=args.comp_threshold,
+            enforce_hybrid_criteria=(args.pobs_mode == "hybrid"),
+            lib_vmag_max=float(args.lib_vmag_max),
+            min_bands_nonzero=int(args.hybrid_min_bands_nonzero),
         )
     after_clean = sum(len(c["phot"]) for c in catalogs)
 
@@ -311,7 +326,15 @@ def main() -> int:
     for cat in catalogs:
         cat["libcomp"] = []
         for d in cat["filtersets_detect"]:
-            subset_filters = [str(f) for f in np.array(cat["filters"])[d]]
+            requested_filters = [str(f) for f in np.array(cat["filters"])[d]]
+
+            def _filt_wave_key(filt):
+                match = re.search(r"F(\d+)W", str(filt))
+                if match is not None:
+                    return (0, int(match.group(1)), str(filt))
+                return (1, lib_filter_names.index(str(filt)), str(filt))
+
+            subset_filters = sorted(requested_filters, key=_filt_wave_key)
 
             if args.libcomp_mode == "tabulated":
                 gk = infer_galaxy_key(cat)
@@ -324,27 +347,101 @@ def main() -> int:
             else:
                 dmod = float(cat["dmod"])
                 lib_indices = [lib_filter_names.index(f) for f in subset_filters]
-                lib_phot_subset = np.asarray(phot_neb_ex[:, lib_indices], dtype=float) + dmod
+                all_cat_filters = [str(f) for f in cat["filters"]]
+                full_filter_order = (
+                    sorted(all_cat_filters, key=_filt_wave_key)
+                    if set(subset_filters) < set(all_cat_filters)
+                    else subset_filters
+                )
                 fills = legus_nn_missing_uv_u_fills(
                     cat["filters"],
                     np.asarray(cat["phot"], dtype=float),
                     np.asarray(cat["detect"], dtype=bool),
                     dmod,
-                    [str(f) for f in cat["filters"]],
+                    full_filter_order,
                     subset_filters,
                     use_apparent_magnitude=True,
                 )
-                comp = predict_catalog_completeness_with_nn(
-                    lib_phot_subset,
-                    galaxy_fullname=cat.get("galaxy_fullname", cat["basename"]),
-                    nn_dir=args.nn_dir,
-                    subset_filters=subset_filters,
-                    full_filter_order=[str(f) for f in cat["filters"]],
-                    nn_scaler_path=args.nn_scaler,
-                    nn_model_path=args.nn_model,
-                    missing_band_fills=fills if fills else None,
+                nn_scaler_path, nn_model_path = _nn_scaler_model_paths(
+                    args.nn_dir,
+                    str(cat.get("galaxy_fullname", cat["basename"])),
+                    args.nn_scaler,
+                    args.nn_model,
                 )
-                comp[faint_v_mask] = 0.0
+                if args.pobs_mode == "hybrid":
+                    print(
+                        f"[libcomp] {cat['basename']} pobs_mode=hybrid filterset={subset_filters!r}",
+                        flush=True,
+                    )
+                    bounds_lo, bounds_hi = legus_catalog_abs_bounds(
+                        np.asarray(cat["phot"], dtype=float)[:, d],
+                        np.asarray(cat["detect"], dtype=bool)[:, d],
+                        subset_filters,
+                        range_margin=float(args.hybrid_range_margin),
+                    )
+                    calc = HybridLegusLibCompletenessCalculator(
+                        subset_filters,
+                        bounds_lo,
+                        bounds_hi,
+                        lib_filter_names,
+                        nn_scaler_path,
+                        nn_model_path,
+                        lib_vmag_max=float(args.lib_vmag_max),
+                        min_bands_nonzero=min(int(args.hybrid_min_bands_nonzero), len(subset_filters)),
+                        nn_full_filter_order=[str(f) for f in cat["filters"]],
+                        nn_batch_rows=int(args.hybrid_nn_batch_rows),
+                        nn_missing_band_fills=fills,
+                    )
+                    comp = calc.compute(
+                        phot_neb_ex,
+                        dmod=dmod,
+                        galaxy_fullname=str(cat.get("galaxy_fullname", cat["basename"])),
+                    )["comp_hybrid"]
+                else:
+                    lib_phot_subset = np.asarray(phot_neb_ex[:, lib_indices], dtype=float) + dmod
+                    finite_rows = np.all(np.isfinite(lib_phot_subset), axis=1)
+                    comp_no_criteria = np.zeros(len(finite_rows), dtype=float)
+                    idx = np.flatnonzero(finite_rows)
+                    bs = max(1024, int(args.hybrid_nn_batch_rows))
+                    print(
+                        f"[libcomp] {cat['basename']} pobs_mode={args.pobs_mode} "
+                        f"filterset={subset_filters!r} finite_rows={idx.size}",
+                        flush=True,
+                    )
+                    for start in range(0, idx.size, bs):
+                        rows = idx[start:start + bs]
+                        print(
+                            f"[libcomp] NN batch {start // bs + 1}/{(idx.size + bs - 1) // bs}",
+                            flush=True,
+                        )
+                        comp_no_criteria[rows] = predict_catalog_completeness_with_nn(
+                            lib_phot_subset[rows],
+                            galaxy_fullname=cat.get("galaxy_fullname", cat["basename"]),
+                            nn_dir=None,
+                            subset_filters=subset_filters,
+                            full_filter_order=full_filter_order,
+                            nn_scaler_path=nn_scaler_path,
+                            nn_model_path=nn_model_path,
+                            missing_band_fills=fills if fills else None,
+                        )
+                    if args.pobs_mode == "observed-box":
+                        bounds_lo, bounds_hi = legus_catalog_abs_bounds(
+                            np.asarray(cat["phot"], dtype=float)[:, d],
+                            np.asarray(cat["detect"], dtype=bool)[:, d],
+                            subset_filters,
+                            range_margin=float(args.hybrid_range_margin),
+                        )
+                        inside_box = inside_5d_abs_box(
+                            phot_neb_ex,
+                            lib_column_indices(lib_filter_names, subset_filters),
+                            bounds_lo,
+                            bounds_hi,
+                        )
+                        comp = comp_no_criteria * inside_box.astype(float)
+                    elif args.pobs_mode == "nn":
+                        comp = comp_no_criteria
+                    else:
+                        raise ValueError(f"Unknown pobs_mode: {args.pobs_mode}")
 
             cat["libcomp"].append(np.asarray(comp, dtype=float))
             keep = np.logical_or(keep, cat["libcomp"][-1] >= args.comp_threshold)
@@ -395,19 +492,27 @@ def main() -> int:
             cat["cs"].append(cs)
 
     # fixed comparison parameter vector
-    p = np.zeros(4 + args.nav, dtype=float)
-    p[0] = -2.0
-    p[1] = 6.0
-    p[2] = 0.5 if args.mdd else -1.0
-    p[3] = 5.0 if args.mdd else 7.0
-    p[4:] = np.log10(np.full(args.nav, 1.0 / 3.0))
+    if args.params is not None:
+        p = np.asarray(args.params, dtype=float)
+        expected = 4 + args.nav
+        if p.size != expected:
+            raise ValueError(f"--params expected {expected} values, got {p.size}")
+    else:
+        p = np.zeros(4 + args.nav, dtype=float)
+        p[0] = -2.0
+        p[1] = 6.0
+        p[2] = 0.5 if args.mdd else -1.0
+        p[3] = 5.0 if args.mdd else 7.0
+        p[4:] = np.log10(np.full(args.nav, 1.0 / 3.0))
 
     logl = evaluate_logl(catalogs, p, nav=args.nav, mdd=args.mdd)
 
     print("=== Ablation summary ===")
     print(f"clean_mode={args.clean_mode}")
     print(f"libcomp_mode={args.libcomp_mode}")
+    print(f"pobs_mode={args.pobs_mode}")
     print(f"comp_threshold={args.comp_threshold:.4f}")
+    print("params=" + ",".join(f"{x:.10g}" for x in p))
     print(f"catalog clusters: before_clean={before}, after_clean={after_clean}")
     print(f"library rows: before={ncl_init}, after_prune={after_lib}")
     for cat in catalogs:
@@ -418,4 +523,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

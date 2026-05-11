@@ -20,6 +20,7 @@ Output: ``comp_hybrid = comp_nn * rule_ok`` with ``comp_nn == 0`` outside the 5D
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -171,7 +172,10 @@ def batched_joint_nn_libcomp(
     out = np.zeros(n, dtype=float)
     bs = max(1024, int(batch_rows))
     n_batches = (n + bs - 1) // bs
+    progress = os.environ.get("HYBRID_LIBCOMP_PROGRESS", "")
     for b in range(n_batches):
+        if progress:
+            print(f"[hybrid-libcomp] NN batch {b + 1}/{n_batches}", flush=True)
         lo = b * bs
         hi = min((b + 1) * bs, n)
         rows = idx_rows[lo:hi]
