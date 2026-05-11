@@ -20,7 +20,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from slugpy import read_cluster
+import pytest
+
+read_cluster = pytest.importorskip("slugpy").read_cluster
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "bundled_pipeline"))
