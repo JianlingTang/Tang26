@@ -249,6 +249,7 @@ def test_predict_with_repo_nn_dir_glob():
 
 
 def test_clean_legus_requires_nn_source():
+    pytest.importorskip("slugpy")
     from clean_legus import clean_legus
 
     with pytest.raises(ValueError, match="nn_dir or both"):
