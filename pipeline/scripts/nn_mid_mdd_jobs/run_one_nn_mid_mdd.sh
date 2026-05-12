@@ -5,6 +5,8 @@ set -euo pipefail
 : "${OUTNAME:?OUTNAME is required}"
 POBS_MODE="${POBS_MODE:-observed-box}"
 LIB_VMAG_MAX="${LIB_VMAG_MAX:--6.0}"
+NITER="${NITER:-4000}"
+RESTART="${RESTART:-0}"
 
 if [[ -n "${GALAXY_NAMES:-}" ]]; then
   GALAXY_NAMES_NORMALIZED="${GALAXY_NAMES//,/ }"
@@ -46,6 +48,19 @@ if [[ "${MODE}" == "mdd" ]]; then
   MODE_FLAG=(--mdd)
 fi
 
+RESTART_FLAG=()
+case "${RESTART}" in
+  1|true|TRUE|yes|YES)
+    RESTART_FLAG=(--restart)
+    ;;
+  0|false|FALSE|no|NO)
+    ;;
+  *)
+    echo "ERROR: RESTART must be 0/1, true/false, or yes/no; got ${RESTART}" >&2
+    exit 1
+    ;;
+esac
+
 SAFE_GALAXY="${GALAXY_LABEL//[^A-Za-z0-9_]/_}"
 SAFE_OUTNAME="${OUTNAME%.h5}"
 LOG_FILE="${LOG_DIR}/${SAFE_OUTNAME}_${SAFE_GALAXY}_${MODE}.log"
@@ -76,6 +91,8 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
   echo "OUTNAME=${OUTNAME}"
   echo "POBS_MODE=${POBS_MODE}"
   echo "LIB_VMAG_MAX=${LIB_VMAG_MAX}"
+  echo "NITER=${NITER}"
+  echo "RESTART=${RESTART}"
   python3 -c "import torch, sklearn; print('torch', torch.__version__, torch.__file__); print('sklearn', sklearn.__version__, sklearn.__file__)"
 
   python "${BUNDLE_DIR}/analyze_catalog_mid_mdd.py" \
@@ -92,13 +109,14 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
     --output-mcmc-chains-dir "${OUT_CHAIN_DIR}" \
     --cattype LEGUS \
     --nwalkers 100 \
-    --niter 4000 \
+    --niter "${NITER}" \
     --bwphot 0.05 \
     --bwphys 0.05 \
     --hybrid-range-margin 0.05 \
     --pobs-mode "${POBS_MODE}" \
     --lib-vmag-max "${LIB_VMAG_MAX}" \
     "${MODE_FLAG[@]}" \
+    "${RESTART_FLAG[@]}" \
     --outname "${OUTNAME}" \
     --verbose
 } 2>&1 | tee "${LOG_FILE}"
