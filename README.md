@@ -1,4 +1,4 @@
-# Tang26B Cluster Demographics Pipeline
+# Cluster Demographics Pipeline
 
 This workspace contains the current LEGUS + SLUG forward-modelling pipeline for
 inferring young star cluster population parameters from integrated photometry.
