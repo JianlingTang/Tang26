@@ -18,6 +18,6 @@ GALAXY_NAMES="ngc628-c ngc628-e"
 MODE="mdd"
 POBS_MODE="hybrid"
 LIB_VMAG_MAX="-6.0"
-OUTNAME="ngc628_mdd_pobs_hybrid_mv6.h5"
+OUTNAME="ngc628_mdd_pobs_hybrid_mv6_padova.h5"
 export GALAXY_NAMES MODE POBS_MODE LIB_VMAG_MAX OUTNAME
 exec /g/data/jh2/jt4478/Tang26B/pipeline/scripts/nn_mid_mdd_jobs/run_one_nn_mid_mdd.sh

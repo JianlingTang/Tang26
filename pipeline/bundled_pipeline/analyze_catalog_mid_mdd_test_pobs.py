@@ -168,7 +168,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--test-pobs-mode",
-    choices=("none", "bright-v-cut", "shift-completeness-minus1"),
+    choices=("none", "bright-v-cut", "shift-completeness-minus1", "v-near-cut-lowcomp"),
     default="none",
     help=(
         "test-only pobs/catalog ablation. none: original behavior. "
@@ -176,7 +176,9 @@ parser.add_argument(
         "and force library comp=0 for M_V > --test-v-abs-cut. "
         "shift-completeness-minus1: evaluate NN completeness after shifting magnitudes "
         "by --test-completeness-mag-shift (default -1 mag, i.e. apparent 25 -> 24), "
-        "and apply the same shift to absolute magnitudes used by observed-box/hybrid gates."
+        "and apply the same shift to absolute magnitudes used by observed-box/hybrid gates. "
+        "v-near-cut-lowcomp: multiply library pobs by --test-lowcomp-factor for rows "
+        "with M_V in [--test-lowcomp-v-cut - --test-lowcomp-v-width, --test-lowcomp-v-cut]."
     ),
 )
 parser.add_argument(
@@ -190,6 +192,24 @@ parser.add_argument(
     type=float,
     default=-1.0,
     help="magnitude shift for --test-pobs-mode shift-completeness-minus1; applied to NN apparent inputs and absolute mags used by gates",
+)
+parser.add_argument(
+    "--test-lowcomp-v-cut",
+    type=float,
+    default=-6.0,
+    help="faint-side absolute V boundary for --test-pobs-mode v-near-cut-lowcomp",
+)
+parser.add_argument(
+    "--test-lowcomp-v-width",
+    type=float,
+    default=0.5,
+    help="bright-side width in magnitudes for --test-pobs-mode v-near-cut-lowcomp; default targets -6.5 <= M_V <= -6.0",
+)
+parser.add_argument(
+    "--test-lowcomp-factor",
+    type=float,
+    default=0.1,
+    help="multiplicative pobs factor for --test-pobs-mode v-near-cut-lowcomp",
 )
 parser.add_argument("-ct", "--cattype", default="LEGUS",
                     help="type of input catalog; currently "
@@ -242,6 +262,12 @@ parser.add_argument("-v", "--verbose", default=False,
                     action='store_true',
                     help="produce verbose output")
 args = parser.parse_args()
+
+if args.test_pobs_mode == "v-near-cut-lowcomp":
+    if args.test_lowcomp_v_width <= 0.0:
+        parser.error("--test-lowcomp-v-width must be > 0 for v-near-cut-lowcomp.")
+    if not (0.0 < args.test_lowcomp_factor <= 1.0):
+        parser.error("--test-lowcomp-factor must be in (0, 1] for v-near-cut-lowcomp.")
 
 os.environ["LEGUS_CCT_ROOT"] = args.legus_cct_root
 os.environ["LEGUS_TAB_DIR"] = args.legus_tab_dir
@@ -745,10 +771,19 @@ if args.test_pobs_mode == "shift-completeness-minus1":
         flush=True,
     )
 v_lib_idx_for_test_cut = None
-if args.test_pobs_mode == "bright-v-cut":
+if args.test_pobs_mode in ("bright-v-cut", "v-near-cut-lowcomp"):
     v_lib_idx_for_test_cut = _resolve_v_index(lib_filter_names)
+if args.test_pobs_mode == "bright-v-cut":
     print(
         f"[test-pobs bright-v-cut] library comp forced to 0 for absolute M_V > {args.test_v_abs_cut:g}",
+        flush=True,
+    )
+elif args.test_pobs_mode == "v-near-cut-lowcomp":
+    lowcomp_hi = float(args.test_lowcomp_v_cut)
+    lowcomp_lo = lowcomp_hi - float(args.test_lowcomp_v_width)
+    print(
+        f"[test-pobs v-near-cut-lowcomp] library comp multiplied by "
+        f"{args.test_lowcomp_factor:g} for {lowcomp_lo:g} <= absolute M_V <= {lowcomp_hi:g}",
         flush=True,
     )
 
@@ -924,6 +959,34 @@ for cat in catalogs:
                 print(
                     f"[test-pobs bright-v-cut] {cat['basename']} filterset={subset_filters!r}; "
                     f"lib rows kept by comp threshold before/after V cut: {n_before}/{n_after}",
+                    flush=True,
+                )
+        elif args.test_pobs_mode == "v-near-cut-lowcomp":
+            v_abs = np.asarray(phot_neb_ex[:, int(v_lib_idx_for_test_cut)], dtype=float)
+            lowcomp_hi = float(args.test_lowcomp_v_cut)
+            lowcomp_lo = lowcomp_hi - float(args.test_lowcomp_v_width)
+            lowcomp_factor = float(args.test_lowcomp_factor)
+            near_v = (
+                np.isfinite(v_abs)
+                & (v_abs >= lowcomp_lo)
+                & (v_abs <= lowcomp_hi)
+            )
+            comp = np.asarray(comp, dtype=float)
+            finite_near = near_v & np.isfinite(comp)
+            n_before = int(np.sum(comp >= args.comp_threshold))
+            n_near = int(np.sum(near_v))
+            n_positive = int(np.sum(finite_near & (comp > 0.0)))
+            mean_before = float(np.mean(comp[finite_near])) if np.any(finite_near) else np.nan
+            comp[near_v] *= lowcomp_factor
+            n_after = int(np.sum(comp >= args.comp_threshold))
+            mean_after = float(np.mean(comp[finite_near])) if np.any(finite_near) else np.nan
+            if args.verbose:
+                print(
+                    f"[test-pobs v-near-cut-lowcomp] {cat['basename']} filterset={subset_filters!r}; "
+                    f"{lowcomp_lo:g} <= M_V <= {lowcomp_hi:g}: rows={n_near}, "
+                    f"positive={n_positive}, mean_comp before/after="
+                    f"{mean_before:.4g}/{mean_after:.4g}, "
+                    f"lib rows kept by comp threshold before/after: {n_before}/{n_after}",
                     flush=True,
                 )
         cat['libcomp'].append(comp)

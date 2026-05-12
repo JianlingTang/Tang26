@@ -8,6 +8,9 @@ LIB_VMAG_MAX="${LIB_VMAG_MAX:--6.0}"
 TEST_POBS_MODE="${TEST_POBS_MODE:-none}"
 TEST_V_ABS_CUT="${TEST_V_ABS_CUT:--6.5}"
 TEST_COMPLETENESS_MAG_SHIFT="${TEST_COMPLETENESS_MAG_SHIFT:--1.0}"
+TEST_LOWCOMP_V_CUT="${TEST_LOWCOMP_V_CUT:--6.0}"
+TEST_LOWCOMP_V_WIDTH="${TEST_LOWCOMP_V_WIDTH:-0.5}"
+TEST_LOWCOMP_FACTOR="${TEST_LOWCOMP_FACTOR:-0.1}"
 
 if [[ -n "${GALAXY_NAMES:-}" ]]; then
   GALAXY_NAMES_NORMALIZED="${GALAXY_NAMES//,/ }"
@@ -30,7 +33,7 @@ LOG_DIR="/g/data/jh2/jt4478/Tang26B/output_io"
 LEGUS_CCT_ROOT="/g/data/jh2/jt4478/make_LEGUS_CCT"
 LEGUS_TAB_DIR="/g/data/jh2/jt4478/Tang26B/cluster_data"
 CLUSTER_SLUG_LIB_DIR="/g/data/jh2/jt4478/cluster_slug"
-CLUSTER_SLUG_LIB_NAME="/g/data/jh2/jt4478/cluster_slug/tang"
+CLUSTER_SLUG_LIB_NAME="/g/data/jh2/jt4478/cluster_slug/tang_padova"
 NN_DIR="/g/data/jh2/jt4478/Tang26B/nn_models"
 OUT_CHAIN_DIR="/g/data/jh2/jt4478/Tang26B/output_chains"
 
@@ -82,6 +85,9 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
   echo "TEST_POBS_MODE=${TEST_POBS_MODE}"
   echo "TEST_V_ABS_CUT=${TEST_V_ABS_CUT}"
   echo "TEST_COMPLETENESS_MAG_SHIFT=${TEST_COMPLETENESS_MAG_SHIFT}"
+  echo "TEST_LOWCOMP_V_CUT=${TEST_LOWCOMP_V_CUT}"
+  echo "TEST_LOWCOMP_V_WIDTH=${TEST_LOWCOMP_V_WIDTH}"
+  echo "TEST_LOWCOMP_FACTOR=${TEST_LOWCOMP_FACTOR}"
   python3 -c "import torch, sklearn; print('torch', torch.__version__, torch.__file__); print('sklearn', sklearn.__version__, sklearn.__file__)"
 
   python "${BUNDLE_DIR}/analyze_catalog_mid_mdd_test_pobs.py" \
@@ -107,6 +113,9 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
     --test-pobs-mode "${TEST_POBS_MODE}" \
     --test-v-abs-cut "${TEST_V_ABS_CUT}" \
     --test-completeness-mag-shift "${TEST_COMPLETENESS_MAG_SHIFT}" \
+    --test-lowcomp-v-cut "${TEST_LOWCOMP_V_CUT}" \
+    --test-lowcomp-v-width "${TEST_LOWCOMP_V_WIDTH}" \
+    --test-lowcomp-factor "${TEST_LOWCOMP_FACTOR}" \
     "${MODE_FLAG[@]}" \
     --outname "${OUTNAME}" \
     --verbose
