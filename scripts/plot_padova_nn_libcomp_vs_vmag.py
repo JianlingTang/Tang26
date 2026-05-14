@@ -89,6 +89,19 @@ def parse_args() -> argparse.Namespace:
         "--out-npz",
         default=str(ROOT / "output_io/padova_nn_libcomp_vs_vmag_stride100.npz"),
     )
+    p.add_argument(
+        "--phot-cache",
+        default=None,
+        help=(
+            "Optional sampled phot_neb_ex cache. If omitted, uses "
+            "output_io/padova_phot_neb_ex_stride{stride}.npz."
+        ),
+    )
+    p.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Ignore an existing sampled photometry cache and rebuild it from FITS/slugpy.",
+    )
     return p.parse_args()
 
 
@@ -131,20 +144,48 @@ def main() -> int:
     if stride <= 0:
         raise ValueError("--stride must be positive")
 
+    cache_path = (
+        Path(args.phot_cache)
+        if args.phot_cache
+        else ROOT / "output_io" / f"padova_phot_neb_ex_stride{stride}.npz"
+    )
+
     print(f"[read] lib={args.lib}", flush=True)
     print(f"[read] filters={filters}", flush=True)
-    if args.use_slugpy:
-        phot_abs, full_shape = _read_phot_neb_ex_slugpy(
-            args.lib,
-            args.photsystem,
-            filters,
-            stride,
-        )
-        read_mode = "slugpy"
+    if cache_path.exists() and not args.refresh_cache:
+        cached = np.load(cache_path, allow_pickle=False)
+        cached_filters = [str(f) for f in cached["filters"]]
+        if cached_filters != filters:
+            raise ValueError(
+                f"Photometry cache filters do not match request: {cached_filters} != {filters}"
+            )
+        if int(cached["stride"]) != stride:
+            raise ValueError(f"Photometry cache stride does not match request: {cached['stride']} != {stride}")
+        phot_abs = np.asarray(cached["phot_abs"], dtype=float)
+        full_shape = tuple(int(x) for x in cached["full_shape"])
+        read_mode = "cache"
     else:
-        phot_abs = _read_phot_neb_ex_fast(args.lib, filters, stride)
-        full_shape = (phot_abs.shape[0] * stride, phot_abs.shape[1])
-        read_mode = "fits-columns"
+        if args.use_slugpy:
+            phot_abs, full_shape = _read_phot_neb_ex_slugpy(
+                args.lib,
+                args.photsystem,
+                filters,
+                stride,
+            )
+            read_mode = "slugpy"
+        else:
+            phot_abs = _read_phot_neb_ex_fast(args.lib, filters, stride)
+            full_shape = (phot_abs.shape[0] * stride, phot_abs.shape[1])
+            read_mode = "fits-columns"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            cache_path,
+            phot_abs=phot_abs,
+            filters=np.array(filters),
+            stride=stride,
+            full_shape=np.array(full_shape, dtype=np.int64),
+        )
+        print(f"[cache] wrote {cache_path}", flush=True)
     phot_app = phot_abs + float(args.dmod)
 
     v_col = int(args.v_col)

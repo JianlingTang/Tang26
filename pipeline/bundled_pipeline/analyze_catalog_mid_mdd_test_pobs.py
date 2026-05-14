@@ -5,6 +5,7 @@ This script finds the cluster population parameters using truncated model for ca
 import argparse
 import copy
 import glob
+import multiprocessing as mp
 import os
 import os.path as osp
 import sys
@@ -230,6 +231,8 @@ parser.add_argument("--bwphys", type=float, default=0.1,
                     help="physical bandwidth")
 parser.add_argument("-nw", "--nwalkers", type=int, default=100,
                     help="number of walkers to use in the MCMC")
+parser.add_argument("--nprocs", type=int, default=int(os.environ.get("PBS_NCPUS", "1")),
+                    help="number of worker processes for MCMC likelihood evaluations")
 parser.add_argument("-ni", "--niter", type=int, default=500,
                     help="number of MCMC iterations")
 parser.add_argument("-mdd", "--mdd", default=False,
@@ -1107,5 +1110,15 @@ else:
 # Run the MCMC, saving periodically
 if args.verbose:
     print("Starting MCMC")
-sampler = emcee.EnsembleSampler(args.nwalkers, ndim, lnprob, backend=backend)
-sampler.run_mcmc(p0, args.niter-nread)
+nprocs = min(args.nprocs, args.nwalkers)
+if nprocs > 1:
+    if args.verbose:
+        print(f"Using {nprocs} worker processes for MCMC")
+    with mp.Pool(processes=nprocs) as pool:
+        sampler = emcee.EnsembleSampler(
+            args.nwalkers, ndim, lnprob, backend=backend, pool=pool
+        )
+        sampler.run_mcmc(p0, args.niter-nread)
+else:
+    sampler = emcee.EnsembleSampler(args.nwalkers, ndim, lnprob, backend=backend)
+    sampler.run_mcmc(p0, args.niter-nread)
