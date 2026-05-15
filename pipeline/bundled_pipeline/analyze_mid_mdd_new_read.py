@@ -5,6 +5,7 @@ This script finds the cluster population parameters using truncated model for ca
 import argparse
 import copy
 import glob
+import importlib.util
 import multiprocessing as mp
 import os
 import os.path as osp
@@ -21,11 +22,11 @@ from slugpy import read_cluster, slug_pdf
 from slugpy.cluster_slug import cluster_slug
 
 from catalog_readers import reader_register
+import catalog_readers as _catalog_readers_mod
 from clean_legus import clean_legus, clean_legus_comp
 from completeness_calculator import comp_register
 from completeness_io import (
     _nn_scaler_model_paths,
-    legus_nn_missing_uv_u_fills,
     predict_catalog_completeness_with_nn,
 )
 from hybrid_libcomp import (
@@ -168,49 +169,25 @@ parser.add_argument(
     help="batch size for joint NN inside hybrid calculator (hybrid only)",
 )
 parser.add_argument(
-    "--test-pobs-mode",
-    choices=("none", "bright-v-cut", "shift-completeness-minus1", "v-near-cut-lowcomp"),
-    default="none",
+    "--old-ngc628-reader",
+    action="store_true",
     help=(
-        "test-only pobs/catalog ablation. none: original behavior. "
-        "bright-v-cut: fit only observed clusters with absolute M_V < --test-v-abs-cut "
-        "and force library comp=0 for M_V > --test-v-abs-cut. "
-        "shift-completeness-minus1: evaluate NN completeness after shifting magnitudes "
-        "by --test-completeness-mag-shift (default -1 mag, i.e. apparent 25 -> 24), "
-        "and apply the same shift to absolute magnitudes used by observed-box/hybrid gates. "
-        "v-near-cut-lowcomp: multiply library pobs by --test-lowcomp-factor for rows "
-        "with M_V in [--test-lowcomp-v-cut - --test-lowcomp-v-width, --test-lowcomp-v-cut]."
+        "Read NGC628 catalogs with /g/data/jh2/jt4478/legus_slug23/catalog_readers.py "
+        "while keeping Tang26B NN completeness and library pobs machinery."
     ),
 )
 parser.add_argument(
-    "--test-v-abs-cut",
-    type=float,
-    default=-6.5,
-    help="absolute V cut for --test-pobs-mode bright-v-cut; keep observed M_V < cut, library M_V > cut has comp=0",
+    "--old-legus-root",
+    default="/g/data/jh2/jt4478/legus_slug23",
+    help="Root containing old catalog_readers.py for --old-ngc628-reader.",
 )
 parser.add_argument(
-    "--test-completeness-mag-shift",
-    type=float,
-    default=-1.0,
-    help="magnitude shift for --test-pobs-mode shift-completeness-minus1; applied to NN apparent inputs and absolute mags used by gates",
-)
-parser.add_argument(
-    "--test-lowcomp-v-cut",
-    type=float,
-    default=-6.0,
-    help="faint-side absolute V boundary for --test-pobs-mode v-near-cut-lowcomp",
-)
-parser.add_argument(
-    "--test-lowcomp-v-width",
-    type=float,
-    default=0.5,
-    help="bright-side width in magnitudes for --test-pobs-mode v-near-cut-lowcomp; default targets -6.5 <= M_V <= -6.0",
-)
-parser.add_argument(
-    "--test-lowcomp-factor",
-    type=float,
-    default=0.1,
-    help="multiplicative pobs factor for --test-pobs-mode v-near-cut-lowcomp",
+    "--disable-hybrid-clean-criteria",
+    action="store_true",
+    help=(
+        "Do not apply the extra observed-catalog V/B-I/Nband/Vmag clean when "
+        "--pobs-mode hybrid is used. Useful for old-reader + NN clean ablations."
+    ),
 )
 parser.add_argument("-ct", "--cattype", default="LEGUS",
                     help="type of input catalog; currently "
@@ -266,12 +243,6 @@ parser.add_argument("-v", "--verbose", default=False,
                     help="produce verbose output")
 args = parser.parse_args()
 
-if args.test_pobs_mode == "v-near-cut-lowcomp":
-    if args.test_lowcomp_v_width <= 0.0:
-        parser.error("--test-lowcomp-v-width must be > 0 for v-near-cut-lowcomp.")
-    if not (0.0 < args.test_lowcomp_factor <= 1.0):
-        parser.error("--test-lowcomp-factor must be in (0, 1] for v-near-cut-lowcomp.")
-
 os.environ["LEGUS_CCT_ROOT"] = args.legus_cct_root
 os.environ["LEGUS_TAB_DIR"] = args.legus_tab_dir
 os.environ["CLUSTER_SLUG_LIB_DIR"] = args.cluster_slug_lib_dir
@@ -281,6 +252,168 @@ if (args.nn_scaler is None) ^ (args.nn_model is None):
     parser.error("--nn-scaler and --nn-model must be given together.")
 if args.nn_scaler is None and args.nn_comp_dir is None:
     parser.error("Provide --nn-comp-dir (--nn-dir), or both --nn-scaler and --nn-model.")
+
+old_reader_register = None
+if args.old_ngc628_reader:
+    old_reader_path = osp.join(args.old_legus_root, "catalog_readers.py")
+    spec = importlib.util.spec_from_file_location("old_ngc628_catalog_readers", old_reader_path)
+    if spec is None or spec.loader is None:
+        parser.error(f"Could not load old reader from {old_reader_path}")
+    old_reader_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old_reader_mod)
+    old_reader_register = old_reader_mod.reader_register
+    print(f"[old-ngc628-reader] using {old_reader_path}")
+
+def _is_legus_uv_or_u_filter(filt):
+    text = str(filt).upper()
+    return ("F275W" in text) or ("F336W" in text)
+
+
+def legus_nn_missing_uv_u_fills(
+    filters_cat,
+    phot,
+    detect,
+    dmod,
+    full_filter_order,
+    subset_filters,
+    use_apparent_magnitude=True,
+):
+    """
+    Fill missing UV/U NN inputs with a faint catalog-side magnitude.
+
+    If a filterset lacks F275W/F336W, the NN still expects those columns for a
+    full-filter model. Use the faint end of detected catalog magnitudes
+    (maximum magnitude, plus a small margin) rather than the bright end.
+    """
+    subset_set = {str(f) for f in subset_filters}
+    filters_cat_names = [str(f) for f in filters_cat]
+    fills = {}
+    for filt in full_filter_order:
+        filt_name = str(filt)
+        if filt_name in subset_set or not _is_legus_uv_or_u_filter(filt_name):
+            continue
+        if filt_name not in filters_cat_names:
+            continue
+        j = filters_cat_names.index(filt_name)
+        ok = np.asarray(detect[:, j], dtype=bool) & np.isfinite(phot[:, j])
+        if not np.any(ok):
+            continue
+        mag = np.asarray(phot[ok, j], dtype=float)
+        if use_apparent_magnitude:
+            mag = mag + float(dmod)
+        fills[filt_name] = float(np.max(mag)) + 0.5
+    return fills
+
+
+# clean_legus imports the fill helper at module import time, so point that
+# function global at this corrected implementation for this script only.
+clean_legus.__globals__["legus_nn_missing_uv_u_fills"] = legus_nn_missing_uv_u_fills
+
+
+def _read_legus_hlsp_no_err_cut(fname, classcut=(0, 3.5)):
+    """
+    Read LEGUS HLSP CCT catalogs without using photerr > 0.3 as a rejection.
+
+    This mirrors catalog_reader_legus_hlsp.read except that large finite
+    photometric errors are retained as detections. Sentinel magnitudes and
+    non-finite magnitudes/errors are still treated as missing.
+    """
+    readme_path = _catalog_readers_mod._find_hlsp_readme_for_catalog(fname)
+    dmod, filters, first_mag_index, class_index, ra_index, debug_meta = (
+        _catalog_readers_mod._parse_hlsp_readme_metadata(readme_path)
+    )
+    data = _catalog_readers_mod.asc.read(fname)
+
+    cid = np.array(data["col1"], dtype=int)
+    nc = len(cid)
+    nf = len(filters)
+    phot = np.zeros((nc, nf))
+    photerr = np.zeros((nc, nf))
+    detect = np.ones((nc, nf), dtype=bool)
+    nondetect_flags = np.array([44.444, 66.666, 99.999])
+
+    for i in range(nf):
+        mag_col = f"col{2 * i + first_mag_index}"
+        err_col = f"col{2 * i + first_mag_index + 1}"
+        mag_obs = np.array(data[mag_col], dtype=float)
+        err_obs = np.array(data[err_col], dtype=float)
+        is_flagged = np.isclose(
+            mag_obs[:, None],
+            nondetect_flags[None, :],
+            atol=1.0e-6,
+        ).any(axis=1)
+        bad_err = np.logical_not(np.isfinite(err_obs))
+        bad_mag = np.logical_not(np.isfinite(mag_obs))
+        detect[:, i] = np.logical_not(is_flagged | bad_err | bad_mag)
+        phot[:, i] = np.where(detect[:, i], mag_obs - dmod, np.nan)
+        photerr[:, i] = np.where(detect[:, i], err_obs, np.nan)
+
+    if os.environ.get("LEGUS_DEBUG_HLSP_READ", "0") == "1":
+        first_col = f"col{first_mag_index}"
+        first_vals = np.array(data[first_col], dtype=float)
+        print(f"[hlsp-debug] catalog={fname}")
+        print(f"[hlsp-debug] readme={readme_path}")
+        print(
+            f"[hlsp-debug] readme dmod line: {debug_meta['dmod_line']} ; "
+            f"parsed dmod={debug_meta['dmod_value']}"
+        )
+        print(
+            f"[hlsp-debug] readme first-mag line: {debug_meta['first_mag_line']} ; "
+            f"parsed first_mag_index={debug_meta['first_mag_index']}"
+        )
+        print(
+            f"[hlsp-debug] tab first magnitude column={first_col} "
+            "(apparent mag, one line per cluster as cid,value)"
+        )
+        for cid_i, mag_i in zip(cid, first_vals):
+            print(f"[hlsp-debug] cid={int(cid_i)}, {first_col}={float(mag_i)}")
+
+    ra = np.array(data[f"col{ra_index}"], dtype=float)
+    dec = np.array(data[f"col{ra_index + 1}"], dtype=float)
+    classification = np.array(data[f"col{class_index}"], dtype=int)
+
+    keep_class = np.logical_and(classification > classcut[0], classification < classcut[1])
+
+    v_order = ["F555W", "F606W"]
+    v_idx = None
+    for token in v_order:
+        for i, filt in enumerate(filters):
+            if token in filt:
+                v_idx = i
+                break
+        if v_idx is not None:
+            break
+    if v_idx is None:
+        raise ValueError(f"No V-like filter (F555W/F606W) in parsed filters: {filters}")
+
+    b_candidates = [i for i, filt in enumerate(filters) if any(x in filt for x in ["F435W", "F438W"])]
+    i_candidates = [i for i, filt in enumerate(filters) if "F814W" in filt]
+    b_detect = detect[:, b_candidates].any(axis=1) if len(b_candidates) > 0 else np.zeros(nc, dtype=bool)
+    i_detect = detect[:, i_candidates].any(axis=1) if len(i_candidates) > 0 else np.zeros(nc, dtype=bool)
+
+    keep_v_det = detect[:, v_idx]
+    keep_v_mag = np.where(keep_v_det, phot[:, v_idx] < -6.0, False)
+    keep_nflt = np.sum(detect, axis=1) >= 4
+    keep_b_or_i = np.logical_or(b_detect, i_detect)
+    keep = keep_class & keep_v_det & keep_v_mag & keep_nflt & keep_b_or_i
+    galaxy_fullname = _catalog_readers_mod._infer_galaxy_fullname_from_path(fname)
+
+    return {
+        "path": fname,
+        "basename": osp.splitext(osp.basename(fname))[0],
+        "galaxy_fullname": galaxy_fullname,
+        "cid": cid[keep],
+        "phot": phot[keep],
+        "photerr": photerr[keep],
+        "detect": detect[keep],
+        "filters": filters,
+        "dmod": dmod,
+        "ra": ra[keep],
+        "dec": dec[keep],
+        "class": classification[keep],
+        "viscat": True,
+    }
+
 
 # Optional catalog discovery for multi-galaxy runs (similar to analyze_all.py)
 discovered_catalogs = []
@@ -358,17 +491,9 @@ class libwgts(object):
         # use numexpr
 
         # Inputs
-        use_cached_library = globals().get("lib_physprop") is physprop
-        if use_cached_library:
-            mass = lib_prior_mass
-            time_eval = lib_prior_time
-            av = lib_prior_av
-        else:
-            logm = physprop[:,0]
-            logt = physprop[:,1]
-            av = physprop[:,2]
-            mass = ne.evaluate("10.**logm")
-            time_eval = ne.evaluate("10.**logt")
+        logm = physprop[:,0]
+        logt = physprop[:,1]
+        av = physprop[:,2]
 
         # Stored parameters:
         alphaM = self.alphaM
@@ -376,6 +501,7 @@ class libwgts(object):
         if self.mid:
             alphaT = self.alphaT
             tMid = self.tMid
+            logtMid = np.log10(tMid)
         else:
             gammaMdd = self.gammaMdd
             tMddMin = self.tMddMin
@@ -383,47 +509,34 @@ class libwgts(object):
         # Get weight for M, T distributions
         if self.mid:
             wgt = ne.evaluate(
-                "mass**(alphaM+1)*"
-                "exp(-mass/mBreak) * "
-                "where( time_eval <= tMid, "
-                "       time_eval/tMid, "
-                "       (time_eval/tMid)**(alphaT+1) )")
+                "10.**((alphaM+1)*logm)*"
+                "exp(-10.**logm/mBreak) * "
+                "where( logt <= logtMid, "
+                "       10.**logt/tMid, "
+                "       (10.**logt/tMid)**(alphaT+1) )")
         else:
             eta = ne.evaluate(
-                "(1.0 + gammaMdd*(100.0/mass)**gammaMdd"
-                " * time_eval/tMddMin)**(1.0/gammaMdd)")
+                "(1.0 + gammaMdd*(100.0/10.**logm)**gammaMdd"
+                " * 10.**logt/tMddMin)**(1.0/gammaMdd)")
             wgt = ne.evaluate(
-                "mass**(alphaM+1)*"
+                "10.**((alphaM+1)*logm)*"
                 "eta**(alphaM+1.0-gammaMdd)*"
-                "exp(-mass*eta/mBreak)*"
-                "time_eval")
+                "exp(-10.**logm*eta/mBreak)*"
+                "10.**logt")
 
         # Add A_V weights
 
-        if use_cached_library:
-            av_weight = np.ones_like(wgt)
-            av_bin = lib_prior_av_bin
-            av_frac = lib_prior_av_frac
-            valid_av = lib_prior_av_valid
-            pavlo = self.pav[:-1]
-            pavhi = self.pav[1:]
-            av_weight[valid_av] = (
-                pavlo[av_bin[valid_av]]
-                + av_frac[valid_av] * (pavhi[av_bin[valid_av]] - pavlo[av_bin[valid_av]])
+        for i in range(self.nav):
+            avlo = self.av[i]
+            avhi = self.av[i+1]
+            pavlo = self.pav[i]
+            pavhi = self.pav[i+1]
+            avslope = (pavhi-pavlo) / (avhi-avlo)
+            wgt = ne.evaluate(
+                "wgt * where( (av >= avlo) & (av < avhi),"
+                "             pavlo + (av-avlo)*avslope,"
+                "             1.0 )"
             )
-            wgt *= av_weight
-        else:
-            for i in range(self.nav):
-                avlo = self.av[i]
-                avhi = self.av[i+1]
-                pavlo = self.pav[i]
-                pavhi = self.pav[i+1]
-                avslope = (pavhi-pavlo) / (avhi-avlo)
-                wgt = ne.evaluate(
-                    "wgt * where( (av >= avlo) & (av < avhi),"
-                    "             pavlo + (av-avlo)*avslope,"
-                    "             1.0 )"
-                )
 
         # Return final result
         return wgt
@@ -478,12 +591,10 @@ def lnprob(params):
 
     # Evaluate unless we're out of bounds
     if logL == 0.0:
-        # Compute prior weights for all 4 filtersets
-        prior_wgts = wgts.wgts(lib_physprop)
         # Adjust catalog weights for this set of parameters
         for cat in catalogs:
-            for cs, cs_keep in zip(cat['cs'], cat['cs_lib_keep']):
-                cs.priors = prior_wgts[cs_keep]
+            for cs in cat['cs']:
+                cs.priors = wgts.wgts
 
         # Stop timer for application of weights
         if args.verbose:
@@ -562,75 +673,6 @@ def predict_library_completeness_no_criteria(
     return comp, finite_rows
 
 
-def _resolve_v_index(filters):
-    for cand in ("ACS_F555W", "WFC3_UVIS_F555W"):
-        if cand in list(filters):
-            return list(filters).index(cand)
-    for i, filt in enumerate(filters):
-        if str(filt).endswith("F555W"):
-            return i
-    raise ValueError(f"Could not resolve V/F555W filter in {filters!r}")
-
-
-def _rebuild_filtersets_for_catalog(data):
-    filtersets = []
-    filtersets_detect = []
-    fset = np.zeros(len(data["phot"]))
-    for i, d in enumerate(data["detect"]):
-        f = list(np.array(data["filters"])[d])
-        if f not in filtersets:
-            filtersets.append(f)
-            filtersets_detect.append(np.copy(d))
-        fset[i] = filtersets.index(f)
-    data["filtersets"] = filtersets
-    data["filtersets_index"] = fset
-    data["filtersets_detect"] = filtersets_detect
-    data["cid_filterset"] = []
-    data["phot_filterset"] = []
-    data["photerr_filterset"] = []
-    for i, d in enumerate(filtersets_detect):
-        idx = fset == i
-        data["cid_filterset"].append(data["cid"][idx])
-        data["phot_filterset"].append(data["phot"][idx][:, d])
-        data["photerr_filterset"].append(data["photerr"][idx][:, d])
-
-
-def _subset_catalog_rows(data, row_mask):
-    row_mask = np.asarray(row_mask, dtype=bool)
-    nrow = len(row_mask)
-    for key, val in list(data.items()):
-        if key in {
-            "filtersets",
-            "filtersets_index",
-            "filtersets_detect",
-            "cid_filterset",
-            "phot_filterset",
-            "photerr_filterset",
-            "comp_filterset",
-        }:
-            continue
-        if isinstance(val, np.ndarray) and val.shape[:1] == (nrow,):
-            data[key] = val[row_mask]
-        elif isinstance(val, list) and len(val) == nrow:
-            data[key] = [v for v, keep in zip(val, row_mask) if keep]
-    _rebuild_filtersets_for_catalog(data)
-
-
-def _apply_observed_absolute_v_cut(catalogs, v_abs_cut):
-    for cat in catalogs:
-        v_idx = _resolve_v_index(cat["filters"])
-        phot = np.asarray(cat["phot"], dtype=float)
-        detect = np.asarray(cat["detect"], dtype=bool)
-        keep = detect[:, v_idx] & np.isfinite(phot[:, v_idx]) & (phot[:, v_idx] < float(v_abs_cut))
-        before = len(keep)
-        _subset_catalog_rows(cat, keep)
-        print(
-            f"[test-pobs bright-v-cut] {cat['basename']}: observed absolute M_V < {v_abs_cut:g}; "
-            f"kept {int(np.sum(keep))}/{before}",
-            flush=True,
-        )
-
-
 
 
 ###############
@@ -649,7 +691,20 @@ for cat in args.catalogs:
     if args.cattype == "mock":
         data = reader_register['mock'].read(cat)
     elif args.cattype == "LEGUS":
-        data = reader_register['LEGUS'].read(cat)
+        if args.old_ngc628_reader:
+            data = old_reader_register['LEGUS'].read(cat)
+            basename_lower = data.get("basename", osp.basename(cat)).lower()
+            if "628c" in basename_lower or "ngc628-c" in basename_lower:
+                data["galaxy_fullname"] = "ngc628-c"
+            elif "628e" in basename_lower or "ngc628-e" in basename_lower:
+                data["galaxy_fullname"] = "ngc628-e"
+            else:
+                raise ValueError(
+                    "--old-ngc628-reader only knows how to assign NN models for 628c/e; "
+                    f"got catalog basename {data.get('basename', cat)!r}"
+                )
+        else:
+            data = _read_legus_hlsp_no_err_cut(cat)
     elif args.cattype == "LEGUS_rOGC":
         data = reader_register['LEGUS_rOGC'].read(cat)
     else:
@@ -714,7 +769,9 @@ if args.cattype == "LEGUS":
         nn_scaler_path=args.nn_scaler,
         nn_model_path=args.nn_model,
         comp_threshold=args.comp_threshold,
-        enforce_hybrid_criteria=(args.pobs_mode == "hybrid"),
+        enforce_hybrid_criteria=(
+            args.pobs_mode == "hybrid" and not args.disable_hybrid_clean_criteria
+        ),
         lib_vmag_max=float(args.lib_vmag_max),
         min_bands_nonzero=int(args.hybrid_min_bands_nonzero),
     )
@@ -725,10 +782,6 @@ if args.cattype == "LEGUS":
         print(f"[clean_legus] after  {cat['basename']}: {len(cat['phot'])}")
 elif args.cattype == "LEGUS_rOGC":
     ncl = clean_legus_comp(catalogs, args.verbose)
-
-if args.test_pobs_mode == "bright-v-cut":
-    _apply_observed_absolute_v_cut(catalogs, args.test_v_abs_cut)
-    ncl = sum(len(cat["phot"]) for cat in catalogs)
 
 # We're now done ingesting the input catalogs; print status if verbose
 if args.verbose:
@@ -784,33 +837,6 @@ del lib_all
 ncl_init = len(actual_mass)
 keep = np.zeros(ncl_init, dtype=np.bool)
 lib_filter_names = [str(f) for f in filter_names]
-test_mag_shift = (
-    float(args.test_completeness_mag_shift)
-    if args.test_pobs_mode == "shift-completeness-minus1"
-    else 0.0
-)
-if args.test_pobs_mode == "shift-completeness-minus1":
-    print(
-        f"[test-pobs shift-completeness-minus1] shifting NN apparent inputs and "
-        f"absolute library mags used by gates by {test_mag_shift:+g} mag",
-        flush=True,
-    )
-v_lib_idx_for_test_cut = None
-if args.test_pobs_mode in ("bright-v-cut", "v-near-cut-lowcomp"):
-    v_lib_idx_for_test_cut = _resolve_v_index(lib_filter_names)
-if args.test_pobs_mode == "bright-v-cut":
-    print(
-        f"[test-pobs bright-v-cut] library comp forced to 0 for absolute M_V > {args.test_v_abs_cut:g}",
-        flush=True,
-    )
-elif args.test_pobs_mode == "v-near-cut-lowcomp":
-    lowcomp_hi = float(args.test_lowcomp_v_cut)
-    lowcomp_lo = lowcomp_hi - float(args.test_lowcomp_v_width)
-    print(
-        f"[test-pobs v-near-cut-lowcomp] library comp multiplied by "
-        f"{args.test_lowcomp_factor:g} for {lowcomp_lo:g} <= absolute M_V <= {lowcomp_hi:g}",
-        flush=True,
-    )
 
 for cat in catalogs:
     cat['libcomp'] = []
@@ -847,16 +873,6 @@ for cat in catalogs:
         dmod = float(cat.get("dmod")) #TODO: If dmod is not set, raise an error instead of silently using 0.0, which will lead to incorrect completeness calculations.
         if dmod is None:
             raise ValueError(f"Distance modulus not set for catalog {cat['basename']}")
-        phot_neb_ex_for_comp = (
-            phot_neb_ex + test_mag_shift
-            if args.test_pobs_mode == "shift-completeness-minus1"
-            else phot_neb_ex
-        )
-        dmod_for_nn = (
-            dmod + test_mag_shift
-            if args.test_pobs_mode == "shift-completeness-minus1"
-            else dmod
-        )
         phot_cat_full = np.asarray(cat["phot"], dtype=float)
         detect_cat_full = np.asarray(cat["detect"], dtype=bool)
         nn_uv_u_fills = legus_nn_missing_uv_u_fills(
@@ -868,10 +884,6 @@ for cat in catalogs:
             subset_filters,
             use_apparent_magnitude=True,
         )
-        if args.test_pobs_mode == "shift-completeness-minus1" and nn_uv_u_fills:
-            nn_uv_u_fills = {
-                str(k): float(v) + test_mag_shift for k, v in nn_uv_u_fills.items()
-            }
         nn_fill_kw = {"missing_band_fills": nn_uv_u_fills} if nn_uv_u_fills else {}
         if args.pobs_mode == "hybrid":
             nn_scaler_path, nn_model_path = _nn_scaler_model_paths(
@@ -904,7 +916,7 @@ for cat in catalogs:
                 nn_missing_band_fills=nn_uv_u_fills,
             )
             out = calc.compute(
-                phot_neb_ex_for_comp,
+                phot_neb_ex,
                 dmod=dmod,
                 galaxy_fullname=str(galaxy_fullname),
             )
@@ -920,7 +932,7 @@ for cat in catalogs:
             comp_no_criteria, finite_rows = predict_library_completeness_no_criteria(
                 phot_neb_ex,
                 lib_indices,
-                dmod_for_nn,
+                dmod,
                 galaxy_fullname,
                 args.nn_comp_dir,
                 subset_filters,
@@ -948,7 +960,7 @@ for cat in catalogs:
                 )
                 lib_cols = lib_column_indices(lib_filter_names, subset_filters)
                 inside_box = inside_5d_abs_box(
-                    phot_neb_ex_for_comp,
+                    phot_neb_ex,
                     lib_cols,
                     bounds_lo,
                     bounds_hi,
@@ -973,47 +985,6 @@ for cat in catalogs:
                 raise ValueError(f"Unknown pobs_mode: {args.pobs_mode}")
             cat['libcomp_no_criteria'].append(comp_no_criteria)
             cat['pobs_observed_box'].append(inside_box.astype(float))
-        if args.test_pobs_mode == "bright-v-cut":
-            v_abs = np.asarray(phot_neb_ex[:, int(v_lib_idx_for_test_cut)], dtype=float)
-            faint_v = np.isfinite(v_abs) & (v_abs > float(args.test_v_abs_cut))
-            n_before = int(np.sum(np.asarray(comp) >= args.comp_threshold))
-            comp = np.asarray(comp, dtype=float)
-            comp[faint_v] = 0.0
-            n_after = int(np.sum(comp >= args.comp_threshold))
-            if args.verbose:
-                print(
-                    f"[test-pobs bright-v-cut] {cat['basename']} filterset={subset_filters!r}; "
-                    f"lib rows kept by comp threshold before/after V cut: {n_before}/{n_after}",
-                    flush=True,
-                )
-        elif args.test_pobs_mode == "v-near-cut-lowcomp":
-            v_abs = np.asarray(phot_neb_ex[:, int(v_lib_idx_for_test_cut)], dtype=float)
-            lowcomp_hi = float(args.test_lowcomp_v_cut)
-            lowcomp_lo = lowcomp_hi - float(args.test_lowcomp_v_width)
-            lowcomp_factor = float(args.test_lowcomp_factor)
-            near_v = (
-                np.isfinite(v_abs)
-                & (v_abs >= lowcomp_lo)
-                & (v_abs <= lowcomp_hi)
-            )
-            comp = np.asarray(comp, dtype=float)
-            finite_near = near_v & np.isfinite(comp)
-            n_before = int(np.sum(comp >= args.comp_threshold))
-            n_near = int(np.sum(near_v))
-            n_positive = int(np.sum(finite_near & (comp > 0.0)))
-            mean_before = float(np.mean(comp[finite_near])) if np.any(finite_near) else np.nan
-            comp[near_v] *= lowcomp_factor
-            n_after = int(np.sum(comp >= args.comp_threshold))
-            mean_after = float(np.mean(comp[finite_near])) if np.any(finite_near) else np.nan
-            if args.verbose:
-                print(
-                    f"[test-pobs v-near-cut-lowcomp] {cat['basename']} filterset={subset_filters!r}; "
-                    f"{lowcomp_lo:g} <= M_V <= {lowcomp_hi:g}: rows={n_near}, "
-                    f"positive={n_positive}, mean_comp before/after="
-                    f"{mean_before:.4g}/{mean_after:.4g}, "
-                    f"lib rows kept by comp threshold before/after: {n_before}/{n_after}",
-                    flush=True,
-                )
         cat['libcomp'].append(comp)
         # Keep only clusters that are at least mildly observable in any
         # catalog/filterset; near-zero probabilities are pruned.
@@ -1039,16 +1010,6 @@ if args.verbose:
     print("Pruned library from {:d} to {:d} clusters".
           format(ncl_init, len(actual_mass)))
 
-lib_physprop = np.column_stack((np.log10(actual_mass), np.log10(eval_time), A_V))
-lib_prior_av = lib_physprop[:, 2]
-lib_prior_mass = actual_mass
-lib_prior_time = eval_time
-lib_prior_delta_av = 3.0 / args.nav
-lib_prior_av_valid = (lib_prior_av >= 0.0) & (lib_prior_av < 3.0)
-lib_prior_av_bin = np.floor(lib_prior_av / lib_prior_delta_av).astype(int)
-lib_prior_av_bin = np.clip(lib_prior_av_bin, 0, args.nav - 1)
-lib_prior_av_frac = (lib_prior_av - lib_prior_av_bin * lib_prior_delta_av) / lib_prior_delta_av
-
 # Initialize a cluster_slug library for every catalog and filter set
 if args.verbose:
     print("Initializing cluster_slug objects for input catalogs:")
@@ -1056,7 +1017,6 @@ for cat in catalogs:
     if args.verbose:
         print("   {:s}:".format(cat["basename"]))
     cat['cs'] = []
-    cat['cs_lib_keep'] = []
     for i in range(len(cat['filtersets'])):
         if args.verbose:
             print("      filters {:s}...".
@@ -1068,7 +1028,6 @@ for cat in catalogs:
                       'phot_neb_ex', 'filter_names', 'filter_units']
         idx = cat['filtersets_detect'][i]
         keep = cat['libcomp'][i] >= args.comp_threshold            
-        cat['cs_lib_keep'].append(keep)
         fields = [np.copy(cid[keep]), 
                   np.copy(actual_mass[keep]), 
                   np.copy(eval_time[keep]),
