@@ -7,6 +7,7 @@ POBS_MODE="${POBS_MODE:-observed-box}"
 LIB_VMAG_MAX="${LIB_VMAG_MAX:--6.0}"
 NITER="${NITER:-4000}"
 RESTART="${RESTART:-0}"
+NPROCS="${NPROCS:-32}"
 
 if [[ -n "${GALAXY_NAMES:-}" ]]; then
   GALAXY_NAMES_NORMALIZED="${GALAXY_NAMES//,/ }"
@@ -93,6 +94,7 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
   echo "LIB_VMAG_MAX=${LIB_VMAG_MAX}"
   echo "NITER=${NITER}"
   echo "RESTART=${RESTART}"
+  echo "NPROCS=${NPROCS}"
   python3 -c "import torch, sklearn; print('torch', torch.__version__, torch.__file__); print('sklearn', sklearn.__version__, sklearn.__file__)"
 
   python "${BUNDLE_DIR}/analyze_catalog_mid_mdd.py" \
@@ -109,6 +111,7 @@ mkdir -p "${OUT_CHAIN_DIR}" "${LOG_DIR}"
     --output-mcmc-chains-dir "${OUT_CHAIN_DIR}" \
     --cattype LEGUS \
     --nwalkers 100 \
+    --nprocs "${NPROCS}" \
     --niter "${NITER}" \
     --bwphot 0.05 \
     --bwphys 0.05 \

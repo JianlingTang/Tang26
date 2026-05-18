@@ -5,6 +5,8 @@ This script finds the cluster population parameters using truncated model for ca
 import argparse
 import copy
 import glob
+import importlib.util
+import multiprocessing as mp
 import os
 import os.path as osp
 import sys
@@ -166,6 +168,27 @@ parser.add_argument(
     default=65536,
     help="batch size for joint NN inside hybrid calculator (hybrid only)",
 )
+parser.add_argument(
+    "--old-ngc628-reader",
+    action="store_true",
+    help=(
+        "Read NGC628 catalogs with /g/data/jh2/jt4478/legus_slug23/catalog_readers.py "
+        "while keeping Tang26B NN completeness and library pobs machinery."
+    ),
+)
+parser.add_argument(
+    "--old-legus-root",
+    default="/g/data/jh2/jt4478/legus_slug23",
+    help="Root containing old catalog_readers.py for --old-ngc628-reader.",
+)
+parser.add_argument(
+    "--disable-hybrid-clean-criteria",
+    action="store_true",
+    help=(
+        "Do not apply the extra observed-catalog V/B-I/Nband/Vmag clean when "
+        "--pobs-mode hybrid is used. Useful for old-reader + NN clean ablations."
+    ),
+)
 parser.add_argument("-ct", "--cattype", default="LEGUS",
                     help="type of input catalog; currently "
                     "known values are 'mock' and 'LEGUS' and 'LEGUS_rOGC'; this "
@@ -185,6 +208,8 @@ parser.add_argument("--bwphys", type=float, default=0.1,
                     help="physical bandwidth")
 parser.add_argument("-nw", "--nwalkers", type=int, default=100,
                     help="number of walkers to use in the MCMC")
+parser.add_argument("--nprocs", type=int, default=int(os.environ.get("PBS_NCPUS", "1")),
+                    help="number of worker processes for MCMC likelihood evaluations")
 parser.add_argument("-ni", "--niter", type=int, default=500,
                     help="number of MCMC iterations")
 parser.add_argument("-mdd", "--mdd", default=False,
@@ -227,6 +252,17 @@ if (args.nn_scaler is None) ^ (args.nn_model is None):
     parser.error("--nn-scaler and --nn-model must be given together.")
 if args.nn_scaler is None and args.nn_comp_dir is None:
     parser.error("Provide --nn-comp-dir (--nn-dir), or both --nn-scaler and --nn-model.")
+
+old_reader_register = None
+if args.old_ngc628_reader:
+    old_reader_path = osp.join(args.old_legus_root, "catalog_readers.py")
+    spec = importlib.util.spec_from_file_location("old_ngc628_catalog_readers", old_reader_path)
+    if spec is None or spec.loader is None:
+        parser.error(f"Could not load old reader from {old_reader_path}")
+    old_reader_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old_reader_mod)
+    old_reader_register = old_reader_mod.reader_register
+    print(f"[old-ngc628-reader] using {old_reader_path}")
 
 # Optional catalog discovery for multi-galaxy runs (similar to analyze_all.py)
 discovered_catalogs = []
@@ -504,7 +540,20 @@ for cat in args.catalogs:
     if args.cattype == "mock":
         data = reader_register['mock'].read(cat)
     elif args.cattype == "LEGUS":
-        data = reader_register['LEGUS'].read(cat)
+        if args.old_ngc628_reader:
+            data = old_reader_register['LEGUS'].read(cat)
+            basename_lower = data.get("basename", osp.basename(cat)).lower()
+            if "628c" in basename_lower or "ngc628-c" in basename_lower:
+                data["galaxy_fullname"] = "ngc628-c"
+            elif "628e" in basename_lower or "ngc628-e" in basename_lower:
+                data["galaxy_fullname"] = "ngc628-e"
+            else:
+                raise ValueError(
+                    "--old-ngc628-reader only knows how to assign NN models for 628c/e; "
+                    f"got catalog basename {data.get('basename', cat)!r}"
+                )
+        else:
+            data = reader_register['LEGUS'].read(cat)
     elif args.cattype == "LEGUS_rOGC":
         data = reader_register['LEGUS_rOGC'].read(cat)
     else:
@@ -569,7 +618,9 @@ if args.cattype == "LEGUS":
         nn_scaler_path=args.nn_scaler,
         nn_model_path=args.nn_model,
         comp_threshold=args.comp_threshold,
-        enforce_hybrid_criteria=(args.pobs_mode == "hybrid"),
+        enforce_hybrid_criteria=(
+            args.pobs_mode == "hybrid" and not args.disable_hybrid_clean_criteria
+        ),
         lib_vmag_max=float(args.lib_vmag_max),
         min_bands_nonzero=int(args.hybrid_min_bands_nonzero),
     )
@@ -901,5 +952,15 @@ else:
 # Run the MCMC, saving periodically
 if args.verbose:
     print("Starting MCMC")
-sampler = emcee.EnsembleSampler(args.nwalkers, ndim, lnprob, backend=backend)
-sampler.run_mcmc(p0, args.niter-nread)
+nprocs = min(args.nprocs, args.nwalkers)
+if nprocs > 1:
+    if args.verbose:
+        print(f"Using {nprocs} worker processes for MCMC")
+    with mp.Pool(processes=nprocs) as pool:
+        sampler = emcee.EnsembleSampler(
+            args.nwalkers, ndim, lnprob, backend=backend, pool=pool
+        )
+        sampler.run_mcmc(p0, args.niter-nread)
+else:
+    sampler = emcee.EnsembleSampler(args.nwalkers, ndim, lnprob, backend=backend)
+    sampler.run_mcmc(p0, args.niter-nread)
