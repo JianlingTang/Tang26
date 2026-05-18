@@ -491,9 +491,17 @@ class libwgts(object):
         # use numexpr
 
         # Inputs
-        logm = physprop[:,0]
-        logt = physprop[:,1]
-        av = physprop[:,2]
+        use_cached_library = globals().get("lib_physprop") is physprop
+        if use_cached_library:
+            mass = lib_prior_mass
+            time_eval = lib_prior_time
+            av = lib_prior_av
+        else:
+            logm = physprop[:,0]
+            logt = physprop[:,1]
+            av = physprop[:,2]
+            mass = ne.evaluate("10.**logm")
+            time_eval = ne.evaluate("10.**logt")
 
         # Stored parameters:
         alphaM = self.alphaM
@@ -501,7 +509,6 @@ class libwgts(object):
         if self.mid:
             alphaT = self.alphaT
             tMid = self.tMid
-            logtMid = np.log10(tMid)
         else:
             gammaMdd = self.gammaMdd
             tMddMin = self.tMddMin
@@ -509,34 +516,47 @@ class libwgts(object):
         # Get weight for M, T distributions
         if self.mid:
             wgt = ne.evaluate(
-                "10.**((alphaM+1)*logm)*"
-                "exp(-10.**logm/mBreak) * "
-                "where( logt <= logtMid, "
-                "       10.**logt/tMid, "
-                "       (10.**logt/tMid)**(alphaT+1) )")
+                "mass**(alphaM+1)*"
+                "exp(-mass/mBreak) * "
+                "where( time_eval <= tMid, "
+                "       time_eval/tMid, "
+                "       (time_eval/tMid)**(alphaT+1) )")
         else:
             eta = ne.evaluate(
-                "(1.0 + gammaMdd*(100.0/10.**logm)**gammaMdd"
-                " * 10.**logt/tMddMin)**(1.0/gammaMdd)")
+                "(1.0 + gammaMdd*(100.0/mass)**gammaMdd"
+                " * time_eval/tMddMin)**(1.0/gammaMdd)")
             wgt = ne.evaluate(
-                "10.**((alphaM+1)*logm)*"
+                "mass**(alphaM+1)*"
                 "eta**(alphaM+1.0-gammaMdd)*"
-                "exp(-10.**logm*eta/mBreak)*"
-                "10.**logt")
+                "exp(-mass*eta/mBreak)*"
+                "time_eval")
 
         # Add A_V weights
 
-        for i in range(self.nav):
-            avlo = self.av[i]
-            avhi = self.av[i+1]
-            pavlo = self.pav[i]
-            pavhi = self.pav[i+1]
-            avslope = (pavhi-pavlo) / (avhi-avlo)
-            wgt = ne.evaluate(
-                "wgt * where( (av >= avlo) & (av < avhi),"
-                "             pavlo + (av-avlo)*avslope,"
-                "             1.0 )"
+        if use_cached_library:
+            av_weight = np.ones_like(wgt)
+            av_bin = lib_prior_av_bin
+            av_frac = lib_prior_av_frac
+            valid_av = lib_prior_av_valid
+            pavlo = self.pav[:-1]
+            pavhi = self.pav[1:]
+            av_weight[valid_av] = (
+                pavlo[av_bin[valid_av]]
+                + av_frac[valid_av] * (pavhi[av_bin[valid_av]] - pavlo[av_bin[valid_av]])
             )
+            wgt *= av_weight
+        else:
+            for i in range(self.nav):
+                avlo = self.av[i]
+                avhi = self.av[i+1]
+                pavlo = self.pav[i]
+                pavhi = self.pav[i+1]
+                avslope = (pavhi-pavlo) / (avhi-avlo)
+                wgt = ne.evaluate(
+                    "wgt * where( (av >= avlo) & (av < avhi),"
+                    "             pavlo + (av-avlo)*avslope,"
+                    "             1.0 )"
+                )
 
         # Return final result
         return wgt
@@ -591,10 +611,14 @@ def lnprob(params):
 
     # Evaluate unless we're out of bounds
     if logL == 0.0:
+        # Compute prior weights once for the shared pruned library, then
+        # slice the resulting array for each catalog/filterset-specific
+        # cluster_slug object.
+        prior_wgts = wgts.wgts(lib_physprop)
         # Adjust catalog weights for this set of parameters
         for cat in catalogs:
-            for cs in cat['cs']:
-                cs.priors = wgts.wgts
+            for cs, cs_keep in zip(cat['cs'], cat['cs_lib_keep']):
+                cs.priors = prior_wgts[cs_keep]
 
         # Stop timer for application of weights
         if args.verbose:
@@ -1010,6 +1034,16 @@ if args.verbose:
     print("Pruned library from {:d} to {:d} clusters".
           format(ncl_init, len(actual_mass)))
 
+lib_physprop = np.column_stack((np.log10(actual_mass), np.log10(eval_time), A_V))
+lib_prior_av = lib_physprop[:, 2]
+lib_prior_mass = actual_mass
+lib_prior_time = eval_time
+lib_prior_delta_av = 3.0 / args.nav
+lib_prior_av_valid = (lib_prior_av >= 0.0) & (lib_prior_av < 3.0)
+lib_prior_av_bin = np.floor(lib_prior_av / lib_prior_delta_av).astype(int)
+lib_prior_av_bin = np.clip(lib_prior_av_bin, 0, args.nav - 1)
+lib_prior_av_frac = (lib_prior_av - lib_prior_av_bin * lib_prior_delta_av) / lib_prior_delta_av
+
 # Initialize a cluster_slug library for every catalog and filter set
 if args.verbose:
     print("Initializing cluster_slug objects for input catalogs:")
@@ -1017,6 +1051,7 @@ for cat in catalogs:
     if args.verbose:
         print("   {:s}:".format(cat["basename"]))
     cat['cs'] = []
+    cat['cs_lib_keep'] = []
     for i in range(len(cat['filtersets'])):
         if args.verbose:
             print("      filters {:s}...".
@@ -1028,6 +1063,7 @@ for cat in catalogs:
                       'phot_neb_ex', 'filter_names', 'filter_units']
         idx = cat['filtersets_detect'][i]
         keep = cat['libcomp'][i] >= args.comp_threshold            
+        cat['cs_lib_keep'].append(keep)
         fields = [np.copy(cid[keep]), 
                   np.copy(actual_mass[keep]), 
                   np.copy(eval_time[keep]),
