@@ -34,6 +34,7 @@ from hybrid_libcomp import (
     format_hybrid_libcomp_summary,
     inside_5d_abs_box,
     lib_column_indices,
+    resolve_lib_filter_name,
     legus_catalog_abs_bounds,
 )
 
@@ -303,6 +304,33 @@ def legus_nn_missing_uv_u_fills(
             mag = mag + float(dmod)
         fills[filt_name] = float(np.max(mag)) + 0.5
     return fills
+
+
+
+def _dedupe_preserve_order(items):
+    out = []
+    seen = set()
+    for item in items:
+        item = str(item)
+        if item not in seen:
+            out.append(item)
+            seen.add(item)
+    return out
+
+
+def _read_cluster_filter_name(filt):
+    """
+    Map catalog-side LEGUS filter names to available SLUG library filters.
+
+    The catalog/NN names are kept unchanged elsewhere. This mapping only tells
+    read_cluster which library photometry columns to load.
+    """
+    name = str(filt)
+    if name == "WFC3_UVIS_F435W":
+        return "WFC3_UVIS_F438W"
+    if name == "ACS_F438W":
+        return "ACS_F435W"
+    return name
 
 
 # clean_legus imports the fill helper at module import time, so point that
@@ -838,10 +866,21 @@ lib_den = sample_den(mass_pdf, age_pdf, av_pdf)
 # Read the slug library
 if args.verbose:
     print("Loading cluster_slug library data")
+lib_read_filters = _dedupe_preserve_order(_read_cluster_filter_name(f) for f in allfilters)
+if args.verbose:
+    filter_aliases = [
+        (str(f), _read_cluster_filter_name(f))
+        for f in allfilters
+        if str(f) != _read_cluster_filter_name(f)
+    ]
+    if filter_aliases:
+        print("[filter-alias] read_cluster catalog -> library filters:")
+        for src, dst in filter_aliases:
+            print(f"   {src} -> {dst}")
 lib_all = read_cluster(
     args.libdir,
     photsystem=args.photsystem,
-    read_filters=allfilters,
+    read_filters=lib_read_filters,
 )  # all filters used in catalog data
 
 # Save memory by extracting the fields we need and deleting the rest
@@ -876,7 +915,8 @@ for cat in catalogs:
             match = re.search(r"F(\d+)W", str(filt))
             if match is not None:
                 return (0, int(match.group(1)), str(filt))
-            return (1, lib_filter_names.index(str(filt)), str(filt))
+            lib_name = resolve_lib_filter_name(lib_filter_names, str(filt))
+            return (1, lib_filter_names.index(lib_name), str(filt))
 
         subset_filters = sorted(requested_filters, key=_filt_wave_key)
 
@@ -884,14 +924,18 @@ for cat in catalogs:
             match = re.search(r"F(\d+)W", str(filt))
             if match is not None:
                 return (0, int(match.group(1)), str(filt))
-            return (1, lib_filter_names.index(str(filt)), str(filt))
+            lib_name = resolve_lib_filter_name(lib_filter_names, str(filt))
+            return (1, lib_filter_names.index(lib_name), str(filt))
 
         all_cat_filters = [str(f) for f in cat["filters"]]
         if set(subset_filters) < set(all_cat_filters):
             nn_full_order = sorted(all_cat_filters, key=_filt_wave_key_lib)
         else:
             nn_full_order = subset_filters
-        lib_indices = [lib_filter_names.index(f) for f in subset_filters]
+        lib_indices = [
+            lib_filter_names.index(resolve_lib_filter_name(lib_filter_names, f))
+            for f in subset_filters
+        ]
         # phot_neb_ex is read as absolute magnitude; NN was trained on apparent
         # magnitude, so shift by this catalog's distance modulus first.
         dmod = float(cat.get("dmod")) #TODO: If dmod is not set, raise an error instead of silently using 0.0, which will lead to incorrect completeness calculations.
@@ -1058,7 +1102,8 @@ for cat in catalogs:
                   format(repr(cat["filtersets"][i])))
         idx_cat = []
         for j,idxx in enumerate(cat['filtersets'][i]):
-            idx_cat.append(filter_names.index(idxx))
+            lib_name = resolve_lib_filter_name(filter_names, idxx)
+            idx_cat.append(filter_names.index(lib_name))
         field_list = ['id', 'actual_mass', 'time', 'form_time', 'A_V',
                       'phot_neb_ex', 'filter_names', 'filter_units']
         idx = cat['filtersets_detect'][i]
@@ -1071,9 +1116,9 @@ for cat in catalogs:
                   np.copy(A_V[keep]),
                   np.copy(phot_neb_ex[:,idx_cat][keep]),
                   list(np.array(cat['filters'])[idx]),
-                  list(np.array(filter_units[:len(idx_cat)]))]
+                  [filter_units[k] for k in idx_cat]]
         print('filters are:,',list(np.array(cat['filters'])[idx]))
-        print('filter units are:',list(np.array(filter_units[:len(idx_cat)])))
+        print('filter units are:', [filter_units[k] for k in idx_cat])
         lib_type = namedtuple('cluster_data', field_list)
         lib = lib_type(*fields)
         cat['cs'].append(

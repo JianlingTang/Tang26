@@ -54,26 +54,63 @@ def legus_catalog_abs_bounds(
     return bounds_lo, bounds_hi
 
 
+def library_filter_alias_candidates(filt: str) -> List[str]:
+    """
+    Candidate library filter names for one catalog filter.
+
+    Some LEGUS catalogs use F435W where the SLUG library contains the nearby
+    F438W band, or vice versa. Treat these as library-column aliases while
+    leaving the observed catalog filter names unchanged for NN metadata.
+    """
+    name = str(filt)
+    candidates = [name]
+    if "F435W" in name:
+        candidates.append(name.replace("F435W", "F438W"))
+    if "F438W" in name:
+        candidates.append(name.replace("F438W", "F435W"))
+    return candidates
+
+
+def resolve_lib_filter_name(lib_filter_names: Sequence[str], filt: str) -> str:
+    """Return the first library filter matching ``filt`` or its aliases."""
+    names = [str(f) for f in lib_filter_names]
+    for cand in library_filter_alias_candidates(str(filt)):
+        if cand in names:
+            return cand
+    raise ValueError(
+        f"Could not resolve catalog filter {filt!r} in library filters {names!r}; "
+        f"tried {library_filter_alias_candidates(str(filt))!r}"
+    )
+
+
 def _filt_wave_key(lib_filter_names: List[str], filt: str) -> Tuple[int, int, str]:
     match = re.search(r"F(\d+)W", str(filt))
     if match is not None:
         return (0, int(match.group(1)), str(filt))
-    return (1, lib_filter_names.index(str(filt)), str(filt))
+    return (1, lib_filter_names.index(resolve_lib_filter_name(lib_filter_names, str(filt))), str(filt))
 
 
 def lib_column_indices(lib_filter_names: Sequence[str], filters_cat: Sequence[str]) -> np.ndarray:
     names = [str(f) for f in lib_filter_names]
-    return np.array([names.index(str(f)) for f in filters_cat], dtype=int)
+    return np.array([names.index(resolve_lib_filter_name(names, str(f))) for f in filters_cat], dtype=int)
 
 
 def v_band_lib_index(lib_filter_names: Sequence[str]) -> Optional[int]:
     names = [str(f) for f in lib_filter_names]
-    for cand in ("ACS_F555W", "WFC3_UVIS_F555W"):
+    for cand in ("ACS_F555W", "WFC3_UVIS_F555W", "ACS_F606W", "WFC3_UVIS_F606W"):
         if cand in names:
             return names.index(cand)
     for i, fn in enumerate(names):
-        if str(fn).endswith("F555W"):
+        if str(fn).endswith("F555W") or str(fn).endswith("F606W"):
             return i
+    return None
+
+
+def v_band_catalog_index(filters_cat: Sequence[str]) -> Optional[int]:
+    for token in ("F555W", "F606W"):
+        for i, f in enumerate(filters_cat):
+            if token in str(f):
+                return i
     return None
 
 
@@ -346,18 +383,16 @@ class HybridLegusLibCompletenessCalculator:
             raise ValueError("filters_cat and bounds must have same length")
 
         self._lib_cols = lib_column_indices(self.lib_filter_names, self.filters_cat)
-        self._v_lib_idx = v_band_lib_index(self.lib_filter_names)
         self._b_cat_idx = b_band_catalog_index(self.filters_cat)
         self._i_cat_idx = i_band_catalog_index(self.filters_cat)
-        if self._v_lib_idx is None:
-            raise ValueError("Could not resolve V (F555W) in lib_filter_names")
+        self._v_cat_idx = v_band_catalog_index(self.filters_cat)
+        if self._v_cat_idx is None:
+            raise ValueError(f"Could not resolve V (F555W/F606W) in filters_cat={self.filters_cat!r}")
+        self._v_lib_idx = int(self._lib_cols[self._v_cat_idx])
         if self._b_cat_idx is None and self._i_cat_idx is None:
             raise ValueError(
                 f"Need at least one of B (F435W/F438W) or I (F814W) in filters_cat; got {self.filters_cat}"
             )
-        self._v_cat_idx = next(
-            i for i, f in enumerate(self.filters_cat) if "F555W" in str(f)
-        )
 
         subset = sorted(self.filters_cat, key=lambda ff: _filt_wave_key(self.lib_filter_names, ff))
         self._subset_filters = subset
@@ -374,7 +409,10 @@ class HybridLegusLibCompletenessCalculator:
             self._nn_full_order = sorted(
                 full, key=lambda ff: _filt_wave_key(self.lib_filter_names, ff)
             )
-        self._lib_indices_nn = [self.lib_filter_names.index(f) for f in subset]
+        self._lib_indices_nn = [
+            self.lib_filter_names.index(resolve_lib_filter_name(self.lib_filter_names, f))
+            for f in subset
+        ]
 
     def compute(
         self,
